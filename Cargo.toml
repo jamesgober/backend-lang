@@ -1,0 +1,78 @@
+# =============================================================================
+#  R E P S   ·   backend-lang
+# =============================================================================
+[package]
+name    = "backend-lang"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "Machine-code backend core: machine IR, target descriptions, instruction selection, and SSA register allocation."
+
+# Keywords (5 max)
+keywords = ["backend", "codegen", "register-allocation", "compiler", "lexersketch"]
+
+# Categories
+categories = ["compilers", "development-tools"]
+
+# Links
+homepage      = "https://github.com/jamesgober/backend-lang"
+repository    = "https://github.com/jamesgober/backend-lang"
+documentation = "https://docs.rs/backend-lang"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "backend_lang"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = ["std"]
+std = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# First-party -lang dependencies are wired at v0.2.0, when first used.
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
