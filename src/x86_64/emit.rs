@@ -118,6 +118,16 @@ pub enum EmitError {
     /// A frame large enough to need a probe loop takes its counter in `r11`
     /// or `r10`, and the entry block receives values in both.
     ProbeScratch,
+    /// An operand constraint the instruction relies on does not hold: a
+    /// table branch's temporary is its index register, or a tail call's
+    /// register target is one the epilogue restores.
+    Constraint {
+        /// The instruction.
+        inst: Inst,
+    },
+    /// A function was declared external and also emitted, or a name was
+    /// declared external twice in conflicting ways.
+    ExternalConflict(String),
 }
 
 impl fmt::Display for EmitError {
@@ -159,6 +169,13 @@ impl fmt::Display for EmitError {
             EmitError::ProbeScratch => f.write_str(
                 "the stack probe loop needs r10 or r11, and the entry block receives values in both",
             ),
+            EmitError::Constraint { inst } => write!(
+                f,
+                "{inst}: a table branch's temporary is its index, or a tail call's register target is restored by the epilogue"
+            ),
+            EmitError::ExternalConflict(name) => {
+                write!(f, "`{name}` is declared external and also emitted")
+            }
         }
     }
 }
@@ -240,7 +257,276 @@ impl FunctionInfo {
     }
 }
 
-/// Machine code with the offset of each function.
+/// What a relocation computes. `S` is the symbol's address, `A` the addend,
+/// and `P` the address of the patched bytes.
+///
+/// # Examples
+///
+/// ```
+/// use backend_lang::x86_64::RelocKind;
+///
+/// assert_eq!(RelocKind::Call32.size(), 4);
+/// assert_eq!(RelocKind::Abs64.size(), 8);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RelocKind {
+    /// `S + A - P`, 32 bits: the displacement of a `call` or `jmp` to a
+    /// function (ELF `R_X86_64_PLT32`; object-lang `X86_64Reloc::Plt32`).
+    Call32,
+    /// `S + A - P`, 32 bits: the displacement of a RIP-relative address
+    /// (ELF `R_X86_64_PC32`; object-lang `X86_64Reloc::Pc32`).
+    Pc32,
+    /// `S + A`, 64 bits: an absolute address stored in data (ELF
+    /// `R_X86_64_64`; object-lang `X86_64Reloc::Abs64`).
+    Abs64,
+}
+
+impl RelocKind {
+    /// How many bytes the relocation patches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::x86_64::RelocKind;
+    ///
+    /// assert_eq!(RelocKind::Pc32.size(), 4);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn size(self) -> usize {
+        match self {
+            RelocKind::Call32 | RelocKind::Pc32 => 4,
+            RelocKind::Abs64 => 8,
+        }
+    }
+}
+
+/// A place in the code that refers to a symbol defined elsewhere (declared
+/// with [`Emitter::declare_external`]): the bytes at `offset` receive the
+/// value `kind` computes from the symbol's address and `addend`. The bytes
+/// hold zero until a linker patches them.
+///
+/// # Examples
+///
+/// ```
+/// use backend_lang::mir::Function;
+/// use backend_lang::x86_64::{op, Emitter, RelocKind, SYSV};
+///
+/// let mut f = Function::new("f", &SYSV);
+/// f.omit_frame_pointer();
+/// let b = f.block()?;
+/// let puts = f.symbol("puts")?;
+/// f.push(b, op::CALL, &[puts.into()])?;
+/// f.push(b, op::RET, &[])?;
+/// let mut e = Emitter::new();
+/// e.declare_external("puts")?;
+/// e.function(&f)?;
+/// let p = e.finish()?;
+/// let r = &p.relocations()[0];
+/// assert_eq!((r.kind, r.symbol.as_str(), r.addend), (RelocKind::Call32, "puts", -4));
+/// // The field follows the `call` opcode and holds zero until linked.
+/// assert_eq!(p.bytes()[r.offset - 1..r.offset + 4], [0xE8, 0, 0, 0, 0]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct Reloc {
+    /// Where the patched bytes start, from the start of the code.
+    pub offset: usize,
+    /// What is computed.
+    pub kind: RelocKind,
+    /// The symbol whose address is used.
+    pub symbol: String,
+    /// The constant added to the address.
+    pub addend: i64,
+}
+
+impl Reloc {
+    /// A relocation at `offset` of `kind` against `symbol` plus `addend`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::x86_64::{Reloc, RelocKind};
+    ///
+    /// let r = Reloc::new(8, RelocKind::Abs64, "table", 16);
+    /// assert_eq!(r.addend, 16);
+    /// ```
+    #[must_use]
+    pub fn new(offset: usize, kind: RelocKind, symbol: &str, addend: i64) -> Reloc {
+        Reloc {
+            offset,
+            kind,
+            symbol: String::from(symbol),
+            addend,
+        }
+    }
+}
+
+/// One call site with a record ([`Function::set_call_site`]): where it
+/// returns to, where its GC roots are while it runs, and where unwinding
+/// lands.
+///
+/// # Examples
+///
+/// ```
+/// use backend_lang::mir::{Function, SlotKind};
+/// use backend_lang::x86_64::{op, Emitter, SYSV};
+///
+/// let mut f = Function::new("f", &SYSV);
+/// let root = f.stack_slot(SlotKind::Local { size: 8, align: 8 })?;
+/// let b = f.block()?;
+/// let g = f.symbol("f")?;
+/// let call = f.push(b, op::CALL, &[g.into()])?;
+/// f.push(b, op::RET, &[])?;
+/// f.set_call_site(call, &[root], None)?;
+/// let mut e = Emitter::new();
+/// e.function(&f)?;
+/// let p = e.finish()?;
+/// let site = &p.functions()[0].call_sites()[0];
+/// assert_eq!(site.gc_slots().len(), 1);
+/// assert!(site.return_offset() > 0);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallSiteRecord {
+    return_offset: usize,
+    gc_slots: Vec<i32>,
+    landing_pad: Option<usize>,
+}
+
+impl CallSiteRecord {
+    /// The offset of the instruction after the call (the return address),
+    /// from the start of the code. A stack walker identifies the call by it.
+    ///
+    /// # Examples
+    ///
+    /// See [`CallSiteRecord`].
+    #[inline]
+    #[must_use]
+    pub fn return_offset(&self) -> usize {
+        self.return_offset
+    }
+
+    /// Where the GC roots live while the call runs: byte offsets from the
+    /// caller's stack pointer at the call instruction (before the return
+    /// address is pushed), one 8-byte reference each. This is the call's
+    /// **stack map**: a collector reads the references there and writes the
+    /// relocated ones back, and the caller reloads them after the call.
+    ///
+    /// # Examples
+    ///
+    /// See [`CallSiteRecord`].
+    #[inline]
+    #[must_use]
+    pub fn gc_slots(&self) -> &[i32] {
+        &self.gc_slots
+    }
+
+    /// The offset of the landing pad unwinding through this call reaches, if
+    /// any.
+    ///
+    /// # Examples
+    ///
+    /// See [`CallSiteRecord`].
+    #[inline]
+    #[must_use]
+    pub fn landing_pad(&self) -> Option<usize> {
+        self.landing_pad
+    }
+}
+
+/// One emitted function: its place in the code, its frame, and its call-site
+/// records.
+///
+/// # Examples
+///
+/// ```
+/// use backend_lang::mir::Function;
+/// use backend_lang::x86_64::{op, Emitter, SYSV};
+///
+/// let mut f = Function::new("f", &SYSV);
+/// let b = f.block()?;
+/// f.push(b, op::RET, &[])?;
+/// let mut e = Emitter::new();
+/// e.function(&f)?;
+/// let p = e.finish()?;
+/// let ef = &p.functions()[0];
+/// assert_eq!((ef.name(), ef.offset(), ef.size()), ("f", 0, 6));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmittedFunction {
+    name: String,
+    offset: usize,
+    size: usize,
+    frame: FrameLayout,
+    call_sites: Vec<CallSiteRecord>,
+}
+
+impl EmittedFunction {
+    /// The function's name.
+    ///
+    /// # Examples
+    ///
+    /// See [`EmittedFunction`].
+    #[inline]
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The offset of its first byte.
+    ///
+    /// # Examples
+    ///
+    /// See [`EmittedFunction`].
+    #[inline]
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Its size in bytes, jump tables included.
+    ///
+    /// # Examples
+    ///
+    /// See [`EmittedFunction`].
+    #[inline]
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Its frame. With the stack pointer fixed in the body, the canonical
+    /// frame address is the body's stack pointer plus
+    /// [`cfa_offset`](FrameLayout::cfa_offset), which is all a stack walker
+    /// needs to step from a call site to its caller.
+    ///
+    /// # Examples
+    ///
+    /// See [`EmittedFunction`].
+    #[inline]
+    #[must_use]
+    pub fn frame(&self) -> &FrameLayout {
+        &self.frame
+    }
+
+    /// Its call-site records, in code order.
+    ///
+    /// # Examples
+    ///
+    /// See [`CallSiteRecord`].
+    #[inline]
+    #[must_use]
+    pub fn call_sites(&self) -> &[CallSiteRecord] {
+        &self.call_sites
+    }
+}
+
+/// Machine code with the offset of each function, the relocations against
+/// external symbols, and the call-site records.
 ///
 /// # Examples
 ///
@@ -263,6 +549,8 @@ impl FunctionInfo {
 pub struct Program {
     bytes: Vec<u8>,
     symbols: Vec<(String, usize)>,
+    functions: Vec<EmittedFunction>,
+    relocs: Vec<Reloc>,
 }
 
 impl Program {
@@ -310,8 +598,9 @@ impl Program {
     #[must_use]
     pub fn symbol(&self, name: &str) -> Option<usize> {
         self.symbols
-            .iter()
-            .find(|(n, _)| n == name)
+            .binary_search_by(|(n, _)| n.as_str().cmp(name))
+            .ok()
+            .and_then(|i| self.symbols.get(i))
             .map(|&(_, off)| off)
     }
 
@@ -328,12 +617,77 @@ impl Program {
     pub fn symbols(&self) -> impl Iterator<Item = (&str, usize)> {
         self.symbols.iter().map(|(n, o)| (n.as_str(), *o))
     }
+
+    /// Every function, in emission order, with its size, frame, and
+    /// call-site records.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::x86_64::Emitter;
+    ///
+    /// assert!(Emitter::new().finish()?.functions().is_empty());
+    /// # Ok::<(), backend_lang::x86_64::EmitError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn functions(&self) -> &[EmittedFunction] {
+        &self.functions
+    }
+
+    /// The relocations against external symbols, in code order.
+    ///
+    /// # Examples
+    ///
+    /// See [`Reloc`].
+    #[inline]
+    #[must_use]
+    pub fn relocations(&self) -> &[Reloc] {
+        &self.relocs
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Sym {
     label: Label,
     defined: bool,
+    external: bool,
+}
+
+/// A function emitted but not yet finished: its labels and record ranges.
+#[derive(Clone, Debug)]
+struct PendingFunc {
+    name: String,
+    start: Label,
+    end: Label,
+    frame: FrameLayout,
+    sites: core::ops::Range<usize>,
+}
+
+/// A call site whose return address is a label bound after the call.
+#[derive(Clone, Debug)]
+struct PendingSite {
+    ret: Label,
+    gc: core::ops::Range<usize>,
+    landing: Option<Label>,
+}
+
+/// A reference to an external symbol: the patched field ends `back` bytes
+/// before the label bound right after the instruction (the field is always
+/// the instruction's last four bytes).
+#[derive(Clone, Debug)]
+struct PendingReloc {
+    after: Label,
+    kind: RelocKind,
+    symbol: String,
+}
+
+/// A jump table: eight-byte entries at `at`, each the offset of a target
+/// from the table, filled in once the layout is final.
+#[derive(Clone, Debug)]
+struct PendingTable {
+    at: Label,
+    targets: core::ops::Range<usize>,
 }
 
 /// Emits functions into one buffer of x86-64 machine code.
@@ -374,6 +728,12 @@ pub struct Emitter {
     steps: Vec<Step>,
     sites: Vec<(u32, u32)>,
     labels: Vec<Label>,
+    funcs: Vec<PendingFunc>,
+    call_sites: Vec<PendingSite>,
+    gc_offsets: Vec<i32>,
+    relocs: Vec<PendingReloc>,
+    tables: Vec<PendingTable>,
+    table_targets: Vec<Label>,
 }
 
 /// Per-function state while emitting its body.
@@ -381,8 +741,8 @@ struct Ctx<'a> {
     f: &'a Function,
     frame: &'a FrameLayout,
     site: usize,
+    tables: usize,
 }
-
 impl Emitter {
     /// An empty emitter.
     ///
@@ -536,10 +896,13 @@ impl Emitter {
             let l = self.asm.label();
             self.labels.push(l);
         }
+        let first_site = self.call_sites.len();
+        let first_table = self.tables.len();
         let mut ctx = Ctx {
             f,
             frame: &frame,
             site: 0,
+            tables: 0,
         };
         for (bi, block) in f.blocks().enumerate() {
             let label = self.labels[bi];
@@ -548,17 +911,82 @@ impl Emitter {
                 self.inst(&mut ctx, bi, inst)?;
             }
         }
+        // Jump tables follow the code, zero-filled until the layout is final.
+        for t in first_table..self.tables.len() {
+            let (at, n) = match self.tables.get(t) {
+                Some(p) => (p.at, p.targets.len()),
+                None => continue,
+            };
+            self.asm.bind(at).map_err(EmitError::Asm)?;
+            let zeros = [0u8; 64];
+            let mut left = n.saturating_mul(8);
+            while left > 0 {
+                let k = left.min(zeros.len());
+                self.asm
+                    .bytes(&zeros[..k])
+                    .map_err(|e| asm_error(None, e))?;
+                left -= k;
+            }
+        }
+        let end = self.asm.label();
+        self.asm.bind(end).map_err(EmitError::Asm)?;
+        self.funcs.push(PendingFunc {
+            name: f.name().to_string(),
+            start: entry,
+            end,
+            frame: frame.clone(),
+            sites: first_site..self.call_sites.len(),
+        });
         Ok(FunctionInfo { frame })
     }
 
-    /// Finishes the code: relaxes branches, patches calls, and returns the
-    /// bytes with every function's offset.
+    /// Declares `name` as a symbol defined outside this code (an imported
+    /// function, or data such as a global): every call, tail call, or address
+    /// of it becomes a [`Reloc`] in [`Program::relocations`] instead of an
+    /// error at [`finish`](Emitter::finish).
+    ///
+    /// # Errors
+    ///
+    /// [`EmitError::ExternalConflict`] if a function of that name was already
+    /// emitted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::mir::Function;
+    /// use backend_lang::x86_64::{op, Emitter, SYSV};
+    ///
+    /// let mut f = Function::new("f", &SYSV);
+    /// let b = f.block()?;
+    /// let g = f.symbol("g")?;
+    /// f.push(b, op::TAILCALL, &[g.into()])?;
+    /// let mut e = Emitter::new();
+    /// e.declare_external("g")?;
+    /// e.function(&f)?;
+    /// assert_eq!(e.finish()?.relocations().len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn declare_external(&mut self, name: &str) -> Result<(), EmitError> {
+        let _ = self.label_for(name);
+        match self.symbols.get_mut(name) {
+            Some(s) if s.defined => Err(EmitError::ExternalConflict(name.to_string())),
+            Some(s) => {
+                s.external = true;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Finishes the code: relaxes branches, patches calls and jump tables,
+    /// and returns the bytes with every function's offset, the relocations
+    /// against external symbols, and the call-site records.
     ///
     /// # Errors
     ///
     /// [`EmitError::UndefinedSymbol`] for the first name (in name order)
-    /// that was called but never emitted; [`EmitError::Asm`] if the code
-    /// exceeds 2 GiB.
+    /// that was called but neither emitted nor declared external;
+    /// [`EmitError::Asm`] if the code exceeds 2 GiB.
     ///
     /// # Examples
     ///
@@ -577,18 +1005,80 @@ impl Emitter {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn finish(self) -> Result<Program, EmitError> {
-        if let Some((name, _)) = self.symbols.iter().find(|(_, s)| !s.defined) {
+        if let Some((name, _)) = self.symbols.iter().find(|(_, s)| !s.defined && !s.external) {
             return Err(EmitError::UndefinedSymbol(name.clone()));
         }
         let code = self.asm.finish().map_err(EmitError::Asm)?;
+        let at = |l: Label| {
+            code.label_offset(l)
+                .ok_or(EmitError::Asm(AsmError::Unbound(l)))
+        };
         let symbols = self
             .symbols
             .iter()
+            .filter(|(_, s)| s.defined)
             .filter_map(|(n, s)| code.label_offset(s.label).map(|o| (n.clone(), o)))
             .collect();
+        let mut relocs = Vec::with_capacity(self.relocs.len());
+        for r in &self.relocs {
+            // The field is the last four bytes of its instruction, and the
+            // processor measures from the end of the instruction.
+            let end = at(r.after)?;
+            relocs.push(Reloc {
+                offset: end.saturating_sub(4),
+                kind: r.kind,
+                symbol: r.symbol.clone(),
+                addend: -4,
+            });
+        }
+        let mut patches: Vec<(usize, i64)> = Vec::new();
+        for t in &self.tables {
+            let base = at(t.at)?;
+            for (k, &target) in self
+                .table_targets
+                .get(t.targets.clone())
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+            {
+                let to = at(target)?;
+                patches.push((base + 8 * k, to as i64 - base as i64));
+            }
+        }
+        let mut functions = Vec::with_capacity(self.funcs.len());
+        for pf in &self.funcs {
+            let offset = at(pf.start)?;
+            let size = at(pf.end)?.saturating_sub(offset);
+            let mut call_sites = Vec::with_capacity(pf.sites.len());
+            for ps in self.call_sites.get(pf.sites.clone()).unwrap_or(&[]) {
+                call_sites.push(CallSiteRecord {
+                    return_offset: at(ps.ret)?,
+                    gc_slots: self.gc_offsets.get(ps.gc.clone()).unwrap_or(&[]).to_vec(),
+                    landing_pad: match ps.landing {
+                        Some(l) => Some(at(l)?),
+                        None => None,
+                    },
+                });
+            }
+            functions.push(EmittedFunction {
+                name: pf.name.clone(),
+                offset,
+                size,
+                frame: pf.frame.clone(),
+                call_sites,
+            });
+        }
+        let mut bytes = code.into_bytes();
+        for (pos, value) in patches {
+            if let Some(field) = bytes.get_mut(pos..pos + 8) {
+                field.copy_from_slice(&value.to_le_bytes());
+            }
+        }
         Ok(Program {
-            bytes: code.into_bytes(),
+            bytes,
             symbols,
+            functions,
+            relocs,
         })
     }
 
@@ -602,6 +1092,7 @@ impl Emitter {
             Sym {
                 label,
                 defined: false,
+                external: false,
             },
         );
         label
@@ -610,6 +1101,7 @@ impl Emitter {
     fn define(&mut self, name: &str) -> Result<Label, EmitError> {
         let label = self.label_for(name);
         match self.symbols.get_mut(name) {
+            Some(s) if s.external => Err(EmitError::ExternalConflict(name.to_string())),
             Some(s) if s.defined => Err(EmitError::DuplicateSymbol(name.to_string())),
             Some(s) => {
                 s.defined = true;
@@ -619,10 +1111,48 @@ impl Emitter {
         }
     }
 
+    fn is_external(&self, name: &str) -> bool {
+        self.symbols.get(name).is_some_and(|s| s.external)
+    }
+
+    /// Emits already-encoded bytes that end in a four-byte field referring to
+    /// an external symbol, and records the relocation.
+    fn external_ref(
+        &mut self,
+        inst: Option<Inst>,
+        bytes: &[u8],
+        kind: RelocKind,
+        symbol: &str,
+    ) -> Result<(), EmitError> {
+        self.asm.bytes(bytes).map_err(|e| asm_error(inst, e))?;
+        let after = self.asm.label();
+        self.asm.bind(after).map_err(EmitError::Asm)?;
+        self.relocs.push(PendingReloc {
+            after,
+            kind,
+            symbol: symbol.to_string(),
+        });
+        Ok(())
+    }
+
+    /// `call name` or `jmp name`: to a label when the name is defined here,
+    /// through a relocation when it is external.
+    fn branch_to_symbol(&mut self, inst: Inst, name: &str, jump: bool) -> Result<(), EmitError> {
+        if self.is_external(name) {
+            let opcode = if jump { 0xE9 } else { 0xE8 };
+            return self.external_ref(Some(inst), &[opcode, 0, 0, 0, 0], RelocKind::Call32, name);
+        }
+        let label = self.label_for(name);
+        if jump {
+            self.asm.jmp(label).map_err(|e| asm_error(Some(inst), e))
+        } else {
+            self.asm.call(label).map_err(|e| asm_error(Some(inst), e))
+        }
+    }
+
     fn emit(&mut self, inst: Option<Inst>, i: &IInst) -> Result<(), EmitError> {
         self.asm.emit(i).map_err(|e| asm_error(inst, e))
     }
-
     fn frame_step(&mut self, step: FrameStep, probe_reg: PReg) -> Result<(), EmitError> {
         let rsp = IOp::Reg(IReg::RSP);
         match step {
@@ -825,20 +1355,124 @@ impl Emitter {
                 }
                 self.emit(Some(inst), &IInst::new(M::Ret, []))
             }
-            Enc::Call => match ops.first() {
-                Some(Operand::Symbol(s)) => {
-                    let name = f
-                        .symbol_name(*s)
-                        .ok_or(EmitError::Mir(MirError::UnknownSymbol(*s)))?;
-                    let label = self.label_for(name);
-                    self.asm.call(label).map_err(|e| asm_error(Some(inst), e))
+            Enc::TailCall => {
+                // The target register must outlive the epilogue's pops.
+                let target = match ops.first() {
+                    Some(Operand::Reg(r)) => {
+                        let p = r.as_phys().ok_or(EmitError::VirtualRegister {
+                            block: Block::from_index(bi),
+                            inst: Some(inst),
+                        })?;
+                        if ctx.frame.pushed().contains(&p)
+                            || (ctx.frame.frame_pointer() && p == super::RBP)
+                        {
+                            return Err(EmitError::Constraint { inst });
+                        }
+                        Some(ireg(Some(inst), p, Size::Qword)?)
+                    }
+                    _ => None,
+                };
+                for &step in ctx.frame.epilogue() {
+                    self.frame_step(step, R11)?;
                 }
-                Some(op) => {
-                    let target = self.operand(ctx, inst, op, Size::Qword)?;
-                    self.emit(Some(inst), &IInst::new(M::Call, [target]))
+                match (target, ops.first()) {
+                    (Some(t), _) => self.emit(Some(inst), &IInst::new(M::Jmp, [t])),
+                    (None, Some(Operand::Symbol(s))) => {
+                        let name = f
+                            .symbol_name(*s)
+                            .ok_or(EmitError::Mir(MirError::UnknownSymbol(*s)))?;
+                        self.branch_to_symbol(inst, name, true)
+                    }
+                    _ => Err(EmitError::Mir(MirError::OperandShape { inst, index: 0 })),
                 }
-                None => Err(EmitError::Mir(MirError::OperandShape { inst, index: 0 })),
-            },
+            }
+            Enc::JumpTable => {
+                let reg = |index: usize| -> Result<IReg, EmitError> {
+                    match ops.get(index) {
+                        Some(Operand::Reg(r)) => qword(inst, *r),
+                        _ => Err(EmitError::Mir(MirError::OperandShape { inst, index })),
+                    }
+                };
+                let (t, i) = (reg(0)?, reg(1)?);
+                if t == i {
+                    return Err(EmitError::Constraint { inst });
+                }
+                let table = self.asm.label();
+                let start = self.table_targets.len();
+                for (index, op) in ops.iter().enumerate().skip(2) {
+                    let b = match op {
+                        Operand::Block(call) => call.block(),
+                        _ => return Err(EmitError::Mir(MirError::OperandShape { inst, index })),
+                    };
+                    let l = self
+                        .labels
+                        .get(b.index())
+                        .copied()
+                        .ok_or(EmitError::Mir(MirError::UnknownBlock(b)))?;
+                    self.table_targets.push(l);
+                }
+                self.tables.push(PendingTable {
+                    at: table,
+                    targets: start..self.table_targets.len(),
+                });
+                ctx.tables += 1;
+                // t = &table; t += table[i] (the target's offset from the
+                // table); jmp t. Position-independent: no absolute address.
+                let lea = IInst::new(M::Lea, [IOp::Reg(t), IOp::Mem(IMem::rip(Size::Qword, 0))]);
+                self.asm
+                    .emit_rip(&lea, table)
+                    .map_err(|e| asm_error(Some(inst), e))?;
+                let entry = IMem::new(Size::Qword, t).with_index(i, IScale::X8);
+                self.emit(
+                    Some(inst),
+                    &IInst::new(M::Add, [IOp::Reg(t), IOp::Mem(entry)]),
+                )?;
+                self.emit(Some(inst), &IInst::new(M::Jmp, [IOp::Reg(t)]))
+            }
+            Enc::Call => {
+                match ops.first() {
+                    Some(Operand::Symbol(s)) => {
+                        let name = f
+                            .symbol_name(*s)
+                            .ok_or(EmitError::Mir(MirError::UnknownSymbol(*s)))?;
+                        self.branch_to_symbol(inst, name, false)?;
+                    }
+                    Some(op) => {
+                        let target = self.operand(ctx, inst, op, Size::Qword)?;
+                        self.emit(Some(inst), &IInst::new(M::Call, [target]))?;
+                    }
+                    None => return Err(EmitError::Mir(MirError::OperandShape { inst, index: 0 })),
+                }
+                if let Some(site) = f.call_site(inst) {
+                    // The return address identifies the call to a stack
+                    // walker: bind it right after the call.
+                    let ret = self.asm.label();
+                    self.asm.bind(ret).map_err(EmitError::Asm)?;
+                    let gc_start = self.gc_offsets.len();
+                    for &slot in site.gc_slots() {
+                        let off = ctx
+                            .frame
+                            .slot_offset(slot)
+                            .ok_or(EmitError::Mir(MirError::UnknownSlot(slot)))?;
+                        self.gc_offsets.push(off);
+                    }
+                    let landing = match site.landing_pad() {
+                        Some(b) => Some(
+                            self.labels
+                                .get(b.index())
+                                .copied()
+                                .ok_or(EmitError::Mir(MirError::UnknownBlock(b)))?,
+                        ),
+                        None => None,
+                    };
+                    self.call_sites.push(PendingSite {
+                        ret,
+                        gc: gc_start..self.gc_offsets.len(),
+                        landing,
+                    });
+                }
+                Ok(())
+            }
             Enc::MovImm64 => match (
                 ops.first().and_then(Operand::reg).and_then(Reg::as_phys),
                 ops.get(1),
@@ -884,6 +1518,23 @@ impl Emitter {
                         let name = f
                             .symbol_name(s)
                             .ok_or(EmitError::Mir(MirError::UnknownSymbol(s)))?;
+                        if self.is_external(name) {
+                            // A RIP-relative address of an external symbol:
+                            // no row with a symbol operand has an immediate,
+                            // so the displacement is the last four bytes.
+                            let encoded = isa_lang::x86_64::encode(&i).map_err(|error| {
+                                EmitError::Encode {
+                                    inst: Some(inst),
+                                    error,
+                                }
+                            })?;
+                            return self.external_ref(
+                                Some(inst),
+                                encoded.as_bytes(),
+                                RelocKind::Pc32,
+                                name,
+                            );
+                        }
                         let label = self.label_for(name);
                         self.asm
                             .emit_rip(&i, label)

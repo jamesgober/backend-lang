@@ -43,13 +43,15 @@
 //! and frame options are listed first. The text depends only on the
 //! function, so tests compare it exactly.
 
+pub(crate) mod cfg;
 mod entity;
 mod function;
 mod operand;
 mod print;
 mod verify;
+pub(crate) mod visit;
 
 pub use entity::{Block, CondCode, Inst, StackSlot, Symbol};
-pub use function::{Effects, Function, SlotKind};
+pub use function::{CallSite, Effects, Function, SlotKind};
 pub use operand::{BlockCall, Implicit, ImplicitKind, Mem, Operand, Scale};
 pub use verify::MirError;

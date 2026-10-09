@@ -139,10 +139,16 @@ fn test_every_opcode_encodes_every_accepted_shape_with_matching_flags() {
     for (i, desc) in TARGET.insts().iter().enumerate() {
         let opcode = Opcode::new(i as u16);
         match desc.kind() {
-            InstKind::Copy | InstKind::ParallelCopy | InstKind::Return => continue,
+            // Tail calls and table branches have their own tests (emit.rs).
+            InstKind::Copy
+            | InstKind::ParallelCopy
+            | InstKind::Return
+            | InstKind::TailCall
+            | InstKind::Switch => continue,
             _ => {}
         }
-        if desc.name() == "syscall" {
+        // syscall is raw bytes; landingpad emits nothing.
+        if desc.name() == "syscall" || desc.name() == "landingpad" {
             continue;
         }
         // Operands are made in a scratch function laid out like emit_inst's,

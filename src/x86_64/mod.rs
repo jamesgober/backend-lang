@@ -18,7 +18,9 @@
 mod emit;
 mod table;
 
-pub use emit::{EmitError, Emitter, FunctionInfo, Program};
+pub use emit::{
+    CallSiteRecord, EmitError, EmittedFunction, Emitter, FunctionInfo, Program, Reloc, RelocKind,
+};
 #[cfg(test)]
 use table::ENCODINGS;
 pub use table::op;

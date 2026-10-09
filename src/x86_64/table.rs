@@ -19,9 +19,9 @@
 //!
 //! `push` and `pop` are not MIR instructions: the stack pointer is fixed
 //! between prologue and epilogue so that stack slots have fixed offsets.
-//! 8- and 16-bit arithmetic, `xchg`, and the string and system instructions
-//! are left to instruction selection (backend-lang 0.5), which adds rows as
-//! it needs them.
+//! 8- and 16-bit arithmetic is done in 32-bit registers by instruction
+//! selection; the string instructions, `lock`-prefixed read-modify-writes,
+//! `cmpxchg`, and `mfence` wait on isa-lang forms (ISSUES P11).
 
 use isa_lang::x86_64::{Mnemonic as M, Reg as IReg, Size};
 
@@ -72,6 +72,11 @@ pub(crate) enum Enc {
     Call,
     /// The epilogue, then `ret`.
     Ret,
+    /// The epilogue, then `jmp` to a symbol or register.
+    TailCall,
+    /// `lea t, [rip + table]; add t, [t + i*8]; jmp t`, with the table of
+    /// target offsets placed after the function.
+    JumpTable,
     /// Bytes isa-lang has no form for.
     Raw(&'static [u8]),
 }
@@ -114,6 +119,8 @@ const RU8: OperandRule = OperandRule::Use(GPR, Accept::REG.with_imm(ImmRange::U8
 const MEM: OperandRule = OperandRule::Use(GPR, Accept::MEM);
 const MEM_SYM: OperandRule = OperandRule::Use(GPR, Accept::MEM.with_symbol());
 const RM_SYM: OperandRule = OperandRule::Use(GPR, Accept::RM.with_symbol());
+const REG: OperandRule = OperandRule::Use(GPR, Accept::REG);
+const REG_SYM: OperandRule = OperandRule::Use(GPR, Accept::REG.with_symbol());
 const IMM32: OperandRule = OperandRule::Use(GPR, Accept::NONE.with_imm(ImmRange::I32));
 const IMM64: OperandRule = OperandRule::Use(GPR, Accept::NONE.with_imm(ImmRange::I64));
 const COUNT: OperandRule = OperandRule::Use(GPR, Accept::NONE.with_imm(ImmRange::U8));
@@ -447,4 +454,25 @@ table! {
     SYSCALL: "`syscall`: enter the kernel. Reads `rax` (and the argument registers, attached with `Effects`), writes the result to `rax`, clobbers `rcx`, `r11`, and the flags. Encoded as the bytes `0f 05`: isa-lang 0.2 has no `SYSCALL` form."
         => InstDesc::new("syscall", InstKind::Plain, &[], RAX_, RAX_, RegSet::of(&[RCX, R11, FLAGS])),
         Enc::Raw(&[0x0F, 0x05]);
+    TAILCALL: "`tailcall target`: run the epilogue, then jump to a function by symbol or register; the callee returns to this function's caller. A register target must survive the epilogue (not a callee-saved register the frame restores). Argument registers are attached with `Effects`."
+        => InstDesc::new("tailcall", InstKind::TailCall, &[REG_SYM], NO, NO, RegSet::EMPTY),
+        Enc::TailCall;
+    JMPTBL: "`%t = jmptbl %i, b0, b1, ...`: jump to block `b<i>` through a table of offsets placed after the function. `%i` must already be in range (zero-extended, below the target count); `%t` is a temporary the jump writes before it last reads `%i`. Targets take no arguments."
+        => InstDesc::new("jmptbl", InstKind::Switch, &[D, REG], NO, F, RegSet::EMPTY),
+        Enc::JumpTable;
+    LANDINGPAD: "`landingpad`: the entry of a landing pad. Emits nothing; it defines `rax`, in which the unwinder delivers the exception payload, so the register allocator sees where the payload comes from."
+        => InstDesc::new("landingpad", InstKind::Plain, &[], NO, RAX_, RegSet::EMPTY),
+        Enc::Raw(&[]);
+    XCHG8: "`%d = xchg8 mem, %v`: atomically exchange the byte at `mem` with the low byte of `%v`; `%d` receives the old byte (upper bits unchanged from `%v`). `%v` is tied to `%d`. A full memory barrier."
+        => plain("xchg8", &[D, MEM, T0], NO, NO),
+        isa(M::Xchg, &[op(1, BY), op(0, BY)]);
+    XCHG16: "`%d = xchg16 mem, %v`: atomically exchange 16 bits at `mem` with `%v`; `%d` receives the old value. `%v` is tied to `%d`. A full memory barrier."
+        => plain("xchg16", &[D, MEM, T0], NO, NO),
+        isa(M::Xchg, &[op(1, WD), op(0, WD)]);
+    XCHG32: "`%d = xchg32 mem, %v`: atomically exchange 32 bits at `mem` with `%v`; `%d` receives the old value, zero-extended. `%v` is tied to `%d`. A full memory barrier."
+        => plain("xchg32", &[D, MEM, T0], NO, NO),
+        isa(M::Xchg, &[op(1, DW), op(0, DW)]);
+    XCHG64: "`%d = xchg64 mem, %v`: atomically exchange 64 bits at `mem` with `%v`; `%d` receives the old value. `%v` is tied to `%d`. A full memory barrier."
+        => plain("xchg64", &[D, MEM, T0], NO, NO),
+        isa(M::Xchg, &[op(1, QW), op(0, QW)]);
 }

@@ -21,6 +21,80 @@
 
 ---
 
+## [0.3.0] - 2026-10-09
+
+ir-lang 2.0 to running x86-64 code: instruction selection for the integer,
+control-flow, memory, call, and checked-arithmetic subset, SSA register
+allocation with spilling, rematerialization, and exact stack maps, and
+emission of whole modules with symbols and relocations, differential-tested
+against ir-lang's reference interpreter.
+
+### Added
+
+- The Tier-1 path: `compile(module, options)` and `compile_function`,
+  `Options` (`sysv`, `win64`, `host`, `with_abi`, `with_frame_pointer`,
+  `with_runtime`, `with_jump_tables`, `with_regalloc`), `Compiled` (`code`,
+  `program`, `functions`, `function`, `relocations`, `data`, `imports`,
+  `exports`), `DataObject`, and `CompileError` (`#[non_exhaustive]`).
+- `isel`: `select` and `IselError` (`#[non_exhaustive]`). Every OPS integer
+  operation under every policy ir-lang 2.0.0-alpha.1 carries (`wrap`, `trap`
+  through a per-function trap block, `error` through `check` edges with the
+  OPS code as `err`); comparisons fused into branches and `select`;
+  conversions; loads, stores, stack slots (over-aligned ones too), field and
+  element addressing, globals, function addresses, block memory operations,
+  the x86-64 atomic subset; direct, indirect, and tail calls under SysV and
+  Win64; `switch` as a jump table or a compare tree by density; `safepoint`;
+  `invoke` with landing pads and `resume` (no unwind tables yet).
+- `regalloc`: `allocate`, `allocate_with`, `Options`, `Allocation`,
+  `Location`, `RegAllocError` (`#[non_exhaustive]`), `MAX_ROUNDS`,
+  `DEFAULT_LIVE_BUDGET`. SSA liveness by path exploration (budgeted),
+  dominance-order coloring without an interference graph, affinity
+  coalescing and fixed-register hints, spill-everywhere with
+  rematerialization of constants and addresses, edge copies through the
+  move resolver, callee-saved registers by convention.
+- Stack maps per IR.md §9: GC references stored to root slots around each
+  safepoint and reloaded as the relocated values; the slots are recorded per
+  call site.
+- `mir`: `Function::verify_ssa` (dominance by Lengauer–Tarjan, linear),
+  `CallSite`, `Function::{set_call_site, call_site, call_sites}`, and
+  `MirError::{NotACall, UndefinedVReg, NotDominated}`.
+- `target`: `InstKind::{TailCall, Switch}`.
+- `x86_64`: rows `tailcall`, `jmptbl`, `landingpad`, `xchg8`, `xchg16`,
+  `xchg32`, `xchg64`; `Emitter::declare_external`; `Reloc`, `RelocKind`
+  (`Call32`, `Pc32`, `Abs64`), `CallSiteRecord`, `EmittedFunction`,
+  `Program::{functions, relocations}`; `EmitError::{Constraint,
+  ExternalConflict}`.
+- A dependency on `ir-lang` `=2.0.0-alpha.1` (crates.io), re-exported as
+  `backend_lang::ir_lang`; its `interp` feature as a dev-dependency.
+- Tests: a random generator of valid ir-lang 2.0 programs, run against
+  ir-lang's interpreter in the x86-64 test interpreter (SysV and Win64) and
+  natively in-process on x86-64 Linux and Windows; OPS conformance for every
+  op × type × policy on edge values; allocator assignments checked by an
+  independent liveness; stack maps under a moving collector that walks real
+  frames; landing pads through a minimal unwinder; ELF relocatables and a
+  static executable through object-lang.
+- Benchmarks: compile throughput on 100,000-instruction functions (whole
+  pipeline and each phase, and a high-pressure variant), and compiled code
+  against the interpreter. Example `compile`.
+
+### Changed
+
+- Version 0.3.0; the crate description names instruction selection and
+  register allocation.
+- Dominators in `mir` are computed by Lengauer–Tarjan instead of the
+  Cooper–Harvey–Kennedy iteration, which is quadratic when one block has
+  many predecessors deep in the dominator tree.
+
+### Fixed
+
+- Register allocation: a rematerialized `mov32ri` constant substituted as an
+  immediate now keeps its zero extension (`-1` there is `0xFFFF_FFFF`, not
+  all ones).
+- Register allocation: a value a terminator defines (a jump table's
+  temporary) is never chosen for spilling, since no store can follow it.
+
+---
+
 ## [0.2.0] - 2026-10-08
 
 The foundation of the native backend: machine IR, the backend half of the
@@ -92,6 +166,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/backend-lang/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/backend-lang/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/backend-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/backend-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/backend-lang/releases/tag/v0.1.0

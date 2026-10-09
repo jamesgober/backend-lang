@@ -1,6 +1,13 @@
 //! Benchmarks at realistic scale: building and emitting a 100,000-instruction
-//! MIR function, and resolving parallel copies from small edges up to
-//! 100,000 moves.
+//! MIR function; resolving parallel copies from small edges up to 100,000
+//! moves; compiling 100,000-instruction ir-lang functions (the whole
+//! pipeline and each phase); and the code it produces against ir-lang's
+//! interpreter on a recursive Fibonacci, a counting loop, and a memory
+//! kernel (natively, on x86-64 Linux and Windows).
+
+#[path = "../tests/common/mod.rs"]
+#[allow(unused_imports, reason = "the shared test support")]
+mod common;
 
 use backend_lang::PReg;
 use backend_lang::mir::{Function, Operand, SlotKind, StackSlot};
@@ -154,5 +161,269 @@ fn moves(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, mir, moves);
+/// The whole pipeline and each phase on a 100,000-instruction function of
+/// realistic shape, and on a high-pressure generated one.
+fn compile(c: &mut Criterion) {
+    use backend_lang::Options;
+    let (m, f) = common::irgen::big_function(INSTS);
+    let n = m.function(f).map_or(0, |b| b.inst_count()) as u64;
+    let opts = Options::sysv();
+    let mut g = c.benchmark_group("compile_100k");
+    g.throughput(Throughput::Elements(n));
+    g.sample_size(20);
+    g.bench_function("compile", |b| {
+        b.iter(|| black_box(backend_lang::compile(&m, &opts)))
+    });
+    g.bench_function("isel", |b| {
+        b.iter(|| black_box(backend_lang::isel::select(&m, f, &opts)))
+    });
+    let Ok(selected) = backend_lang::isel::select(&m, f, &opts) else {
+        panic!("selection failed");
+    };
+    g.bench_function("regalloc", |b| {
+        b.iter_batched(
+            || selected.clone(),
+            |mut mir| black_box(backend_lang::regalloc::allocate(&mut mir).map(|a| a.rounds())),
+            BatchSize::LargeInput,
+        )
+    });
+    let Ok(allocated) = backend_lang::compile_function(&m, f, &opts) else {
+        panic!("compilation failed");
+    };
+    g.bench_function("emit", |b| {
+        b.iter(|| {
+            let mut e = x86_64::Emitter::new();
+            let _ = e.declare_external("helper");
+            let _ = e.function(&allocated);
+            black_box(e.finish())
+        })
+    });
+    g.finish();
+
+    // A generated function under heavy register pressure (dozens of values
+    // live across loops and branches; the allocator spills and reruns).
+    let opts_gen = common::irgen::GenOptions {
+        functions: 1,
+        statements: 20_000,
+        traps: false,
+        calls: false,
+        ..common::irgen::GenOptions::default()
+    };
+    let p = common::irgen::generate(1, &opts_gen);
+    let n = p.module.function(p.entry).map_or(0, |b| b.inst_count()) as u64;
+    let mut g = c.benchmark_group("compile_pressure");
+    g.throughput(Throughput::Elements(n));
+    g.sample_size(10);
+    g.bench_function("compile", |b| {
+        b.iter(|| black_box(backend_lang::compile(&p.module, &opts)))
+    });
+    g.finish();
+}
+
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+mod kernels {
+    use ir_lang::{
+        BinaryOp, BlockCall, Builder, Call, CmpOp, Linkage, MemFlags, MemType, Module, Overflow,
+        Policy, Signature, Type, Value,
+    };
+
+    fn ok<T, E: std::fmt::Display>(r: Result<T, E>) -> T {
+        r.unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn loop_head(b: &mut Builder<'_>, types: &[Type]) -> ir_lang::Block {
+        ok(b.create_block(types))
+    }
+
+    /// `fib(n)`, recursively.
+    pub fn fib() -> Module {
+        let mut m = Module::new("fib");
+        let f = ok(m.declare_function(
+            "fib",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Export,
+        ));
+        let mut b = ok(m.build(f));
+        let n = ok(b.param(0));
+        let two = ok(b.iconst(Type::I64, 2));
+        let small = ok(b.compare(CmpOp::Lt, n, two));
+        let base = loop_head(&mut b, &[]);
+        let rec = loop_head(&mut b, &[]);
+        ok(b.branch(small, base, &[], rec, &[]));
+        ok(b.switch_to(base));
+        ok(b.ret(&[n]));
+        ok(b.switch_to(rec));
+        let one = ok(b.iconst(Type::I64, 1));
+        let n1 = ok(b.sub(n, one, Overflow::Wrap));
+        let n2 = ok(b.sub(n, two, Overflow::Wrap));
+        let c1 = ok(b.call(Call::direct(f, &[n1])));
+        let r1 = b.results(c1).first().unwrap_or_else(|| panic!("no result"));
+        let c2 = ok(b.call(Call::direct(f, &[n2])));
+        let r2 = b.results(c2).first().unwrap_or_else(|| panic!("no result"));
+        let s = ok(b.add(r1, r2, Overflow::Wrap));
+        ok(b.ret(&[s]));
+        m
+    }
+
+    /// The sum over `i < n` of `(i * i) ^ i`.
+    pub fn counting_loop() -> Module {
+        let mut m = Module::new("loop");
+        let f = ok(m.declare_function(
+            "run",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Export,
+        ));
+        let mut b = ok(m.build(f));
+        let n = ok(b.param(0));
+        let head = loop_head(&mut b, &[Type::I64, Type::I64]);
+        let body = loop_head(&mut b, &[]);
+        let exit = loop_head(&mut b, &[Type::I64]);
+        let z = ok(b.iconst(Type::I64, 0));
+        ok(b.jump(head, &[z, z]));
+        ok(b.switch_to(head));
+        let i = ok(b.block_param(head, 0));
+        let acc = ok(b.block_param(head, 1));
+        let more = ok(b.compare(CmpOp::Lt, i, n));
+        ok(b.branch(more, body, &[], exit, &[acc]));
+        ok(b.switch_to(body));
+        let sq = ok(b.mul(i, i, Overflow::Wrap));
+        let x = ok(b.binary(BinaryOp::Xor, Policy::NONE, sq, i));
+        let acc2 = ok(b.add(acc, x, Overflow::Wrap));
+        let one = ok(b.iconst(Type::I64, 1));
+        let i2 = ok(b.add(i, one, Overflow::Wrap));
+        ok(b.jump(head, &[i2, acc2]));
+        ok(b.switch_to(exit));
+        let r = ok(b.block_param(exit, 0));
+        ok(b.ret(&[r]));
+        m
+    }
+
+    /// A 1024-word array on the stack: filled, `passes` prefix-sum passes,
+    /// copied with `memcpy`; returns the copy's last word.
+    pub fn memory_kernel() -> Module {
+        let mut m = Module::new("mem");
+        let f = ok(m.declare_function(
+            "run",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Export,
+        ));
+        let mut b = ok(m.build(f));
+        let passes = ok(b.param(0));
+        let a = ok(b.stack_slot(8192, 8));
+        let c2 = ok(b.stack_slot(8192, 8));
+        let pa = ok(b.stack_addr(a));
+        let pc = ok(b.stack_addr(c2));
+        let words = ok(b.iconst(Type::I64, 1024));
+        let one = ok(b.iconst(Type::I64, 1));
+        let z = ok(b.iconst(Type::I64, 0));
+        let fill_head = loop_head(&mut b, &[Type::I64]);
+        let fill_body = loop_head(&mut b, &[]);
+        let pass_head = loop_head(&mut b, &[Type::I64]);
+        ok(b.jump(fill_head, &[z]));
+        ok(b.switch_to(fill_head));
+        let i = ok(b.block_param(fill_head, 0));
+        let more = ok(b.compare(CmpOp::Lt, i, words));
+        ok(b.branch(more, fill_body, &[], pass_head, &[z]));
+        ok(b.switch_to(fill_body));
+        let three = ok(b.iconst(Type::I64, 3));
+        let v = ok(b.mul(i, three, Overflow::Wrap));
+        let at = ok(b.elem_addr(pa, MemType::Scalar(Type::I64), i));
+        let _ = ok(b.store(v, at, MemFlags::new(8)));
+        let i2 = ok(b.add(i, one, Overflow::Wrap));
+        ok(b.jump(fill_head, &[i2]));
+        ok(b.switch_to(pass_head));
+        let p = ok(b.block_param(pass_head, 0));
+        let pass_more = ok(b.compare(CmpOp::Lt, p, passes));
+        let inner = loop_head(&mut b, &[Type::I64]);
+        let inner_body = loop_head(&mut b, &[]);
+        let done = loop_head(&mut b, &[]);
+        ok(b.branch(pass_more, inner, &[one], done, &[]));
+        ok(b.switch_to(inner));
+        let j = ok(b.block_param(inner, 0));
+        let jm = ok(b.compare(CmpOp::Lt, j, words));
+        let p2 = ok(b.add(p, one, Overflow::Wrap));
+        ok(b.branch(jm, inner_body, &[], pass_head, &[p2]));
+        ok(b.switch_to(inner_body));
+        let jp = ok(b.sub(j, one, Overflow::Wrap));
+        let at_p = ok(b.elem_addr(pa, MemType::Scalar(Type::I64), jp));
+        let at_j = ok(b.elem_addr(pa, MemType::Scalar(Type::I64), j));
+        let x = ok(b.load(Type::I64, at_p, MemFlags::new(8)));
+        let y = ok(b.load(Type::I64, at_j, MemFlags::new(8)));
+        let s = ok(b.add(x, y, Overflow::Wrap));
+        let _ = ok(b.store(s, at_j, MemFlags::new(8)));
+        let j2 = ok(b.add(j, one, Overflow::Wrap));
+        ok(b.jump(inner, &[j2]));
+        ok(b.switch_to(done));
+        let bytes = ok(b.iconst(Type::U64, 8192));
+        let _ = ok(b.memcpy(pc, pa, bytes, MemFlags::new(8)));
+        let last = ok(b.iconst(Type::I64, 1023));
+        let at = ok(b.elem_addr(pc, MemType::Scalar(Type::I64), last));
+        let r = ok(b.load(Type::I64, at, MemFlags::new(8)));
+        ok(b.ret(&[r]));
+        m
+    }
+
+    #[allow(dead_code, reason = "keeps the imported names in use")]
+    fn _anchor(v: Value, c: BlockCall) -> (Value, BlockCall) {
+        (v, c)
+    }
+}
+
+/// The compiled code against ir-lang's interpreter, natively.
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+fn quality(c: &mut Criterion) {
+    use backend_lang::Options;
+    use common::load::Conv;
+    use common::native::{Native, Ran};
+    use ir_lang::interp::{Interpreter, Limits, NoHost, Outcome, Val};
+
+    let conv = if cfg!(windows) {
+        Conv::Win64
+    } else {
+        Conv::SysV
+    };
+    let limits = Limits {
+        fuel: u64::MAX,
+        max_depth: 100_000,
+        memory: 16 << 20,
+    };
+    let mut g = c.benchmark_group("quality");
+    g.sample_size(10);
+    for (name, m, entry, arg) in [
+        ("fib_25", kernels::fib(), "fib", 25u64),
+        ("loop_1m", kernels::counting_loop(), "run", 1_000_000),
+        ("memory_1024x20", kernels::memory_kernel(), "run", 20),
+    ] {
+        let compiled =
+            backend_lang::compile(&m, &Options::host()).unwrap_or_else(|e| panic!("{e}"));
+        let native = Native::load(&compiled, conv).unwrap_or_else(|e| panic!("{e}"));
+        let f = m
+            .functions()
+            .next()
+            .unwrap_or_else(|| panic!("no function"));
+        // Both sides compute the same answer.
+        let want = Interpreter::with_limits(&m, NoHost, limits)
+            .and_then(|mut vm| vm.call(f, &[Val::i64(arg as i64)]))
+            .unwrap_or_else(|e| panic!("{e}"));
+        match (&want, native.call(entry, &[arg])) {
+            (Outcome::Return(v), Ok(Ran::Returned(a, _))) if v[0].bits() == a => {}
+            other => panic!("{name}: {other:?}"),
+        }
+        g.bench_function(BenchmarkId::new("native", name), |b| {
+            b.iter(|| black_box(native.call(entry, &[black_box(arg)])))
+        });
+        g.bench_function(BenchmarkId::new("interp", name), |b| {
+            b.iter(|| {
+                Interpreter::with_limits(&m, NoHost, limits)
+                    .and_then(|mut vm| vm.call(f, &[Val::i64(black_box(arg) as i64)]))
+            })
+        });
+    }
+    g.finish();
+}
+
+#[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
+fn quality(_: &mut Criterion) {}
+
+criterion_group!(benches, mir, moves, compile, quality);
 criterion_main!(benches);

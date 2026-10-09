@@ -6,9 +6,12 @@
 //! `syscall` for `exit`) with the flags the conditions read. It is a test
 //! oracle written independently of the emitter: it reads only bytes.
 //!
-//! Memory is one flat stack region. Code lives at `CODE_BASE`, so a
-//! RIP-relative address is `CODE_BASE + offset`. The interpreter checks the
-//! ABI's stack alignment at every `call`.
+//! Memory is a stack region plus any regions a test adds (a copy of the
+//! code, so jump tables can be read; the module's data; a heap). Code lives
+//! at `CODE_BASE`, so a RIP-relative address is `CODE_BASE + offset`.
+//! Addresses from `HOST_BASE` on are host functions: calling or jumping to
+//! one runs a Rust callback ([`Host`]) and returns. The interpreter checks
+//! the ABI's stack alignment at every `call`.
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
 #![allow(clippy::unwrap_used, reason = "test support")]
@@ -16,6 +19,12 @@
 use isa_lang::x86_64::{Cond, Inst, Mem, Mnemonic as M, Operand, Reg, Size, decode};
 
 pub const CODE_BASE: u64 = 0x40_0000;
+/// Where a loaded module's data goes.
+pub const DATA_BASE: u64 = 0x2000_0000;
+/// Host functions: one every 16 bytes from here.
+pub const HOST_BASE: u64 = 0x3000_0000;
+/// A heap for host allocations.
+pub const HEAP_BASE: u64 = 0x5000_0000;
 pub const STACK_BASE: u64 = 0x7000_0000;
 pub const STACK_SIZE: usize = 1 << 20;
 /// The return address the harness pushes; returning to it ends the run.
@@ -31,6 +40,32 @@ pub enum Stop {
     Returned,
     /// `int3`.
     Breakpoint,
+    /// A host function asked to stop with this code (the trap handler).
+    Trap(u64),
+    /// An exception unwound out of the outermost frame with this payload.
+    Unwound(u64),
+}
+
+/// Host functions a run may call.
+pub trait Host {
+    /// Runs host function `index` with the machine as the callee sees it
+    /// (the return address at `rsp`). `Some` stops the run.
+    fn call(&mut self, index: usize, m: &mut Machine) -> Result<Option<Stop>, String>;
+}
+
+/// No host functions.
+pub struct NoHost;
+
+impl Host for NoHost {
+    fn call(&mut self, index: usize, _: &mut Machine) -> Result<Option<Stop>, String> {
+        Err(format!("no host function {index}"))
+    }
+}
+
+/// An extra memory region.
+pub struct Region {
+    pub base: u64,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,6 +81,10 @@ pub struct Machine {
     pub regs: [u64; 16],
     flags: Flags,
     pub mem: Vec<u8>,
+    pub regions: Vec<Region>,
+    /// Set by a host function to continue somewhere other than its return
+    /// address (an unwinder entering a landing pad).
+    pub redirect: Option<usize>,
     pub pc: usize,
     pub steps: u64,
     pub max_steps: u64,
@@ -76,6 +115,8 @@ impl Machine {
             regs: [0; 16],
             flags: Flags::default(),
             mem: vec![0; STACK_SIZE],
+            regions: Vec::new(),
+            redirect: None,
             pc: 0,
             steps: 0,
             max_steps: 50_000_000,
@@ -90,14 +131,44 @@ impl Machine {
         self.regs[4]
     }
 
+    fn slice(&self, addr: u64, bytes: u32) -> Result<&[u8], String> {
+        if let Some(off) = addr.checked_sub(STACK_BASE) {
+            if let Some(s) = self.mem.get(off as usize..off as usize + bytes as usize) {
+                return Ok(s);
+            }
+        }
+        for r in &self.regions {
+            if let Some(off) = addr.checked_sub(r.base) {
+                if let Some(s) = r.bytes.get(off as usize..off as usize + bytes as usize) {
+                    return Ok(s);
+                }
+            }
+        }
+        Err(format!(
+            "access of {bytes} bytes outside memory at {addr:#x}"
+        ))
+    }
+
+    fn slice_mut(&mut self, addr: u64, bytes: u32) -> Result<&mut [u8], String> {
+        if let Some(off) = addr.checked_sub(STACK_BASE) {
+            if (off as usize) + bytes as usize <= self.mem.len() {
+                return Ok(&mut self.mem[off as usize..off as usize + bytes as usize]);
+            }
+        }
+        for r in &mut self.regions {
+            if let Some(off) = addr.checked_sub(r.base) {
+                if (off as usize) + bytes as usize <= r.bytes.len() {
+                    return Ok(&mut r.bytes[off as usize..off as usize + bytes as usize]);
+                }
+            }
+        }
+        Err(format!(
+            "write of {bytes} bytes outside memory at {addr:#x}"
+        ))
+    }
+
     pub fn read(&self, addr: u64, bytes: u32) -> Result<u64, String> {
-        let off =
-            addr.checked_sub(STACK_BASE)
-                .ok_or_else(|| format!("read below the stack at {addr:#x}"))? as usize;
-        let slice = self
-            .mem
-            .get(off..off + bytes as usize)
-            .ok_or_else(|| format!("read outside the stack at {addr:#x}"))?;
+        let slice = self.slice(addr, bytes)?;
         let mut v = 0u64;
         for (i, b) in slice.iter().enumerate() {
             v |= u64::from(*b) << (8 * i);
@@ -106,13 +177,7 @@ impl Machine {
     }
 
     pub fn write(&mut self, addr: u64, bytes: u32, v: u64) -> Result<(), String> {
-        let off =
-            addr.checked_sub(STACK_BASE)
-                .ok_or_else(|| format!("write below the stack at {addr:#x}"))? as usize;
-        let slice = self
-            .mem
-            .get_mut(off..off + bytes as usize)
-            .ok_or_else(|| format!("write outside the stack at {addr:#x}"))?;
+        let slice = self.slice_mut(addr, bytes)?;
         for (i, b) in slice.iter_mut().enumerate() {
             *b = (v >> (8 * i)) as u8;
         }
@@ -248,12 +313,12 @@ impl Machine {
         base ^ (c.code() & 1 == 1)
     }
 
-    fn push(&mut self, v: u64) -> Result<(), String> {
+    pub fn push(&mut self, v: u64) -> Result<(), String> {
         self.regs[4] -= 8;
         self.write(self.regs[4], 8, v)
     }
 
-    fn pop(&mut self) -> Result<u64, String> {
+    pub fn pop(&mut self) -> Result<u64, String> {
         let v = self.read(self.regs[4], 8)?;
         self.regs[4] += 8;
         Ok(v)
@@ -261,11 +326,39 @@ impl Machine {
 
     /// Runs `code` from `entry` until it stops.
     pub fn run(&mut self, code: &[u8], entry: usize) -> Result<Stop, String> {
+        self.run_with(code, entry, &mut NoHost)
+    }
+
+    /// Runs `code` from `entry` with host functions.
+    pub fn run_with(
+        &mut self,
+        code: &[u8],
+        entry: usize,
+        host: &mut dyn Host,
+    ) -> Result<Stop, String> {
         self.pc = entry;
+        let host_pc = (HOST_BASE - CODE_BASE) as usize;
         loop {
             self.steps += 1;
             if self.steps > self.max_steps {
                 return Err("step limit".into());
+            }
+            if self.pc >= host_pc {
+                // A host function: run it, then return as `ret` would.
+                let index = (self.pc - host_pc) / 16;
+                if let Some(stop) = host.call(index, self)? {
+                    return Ok(stop);
+                }
+                if let Some(pc) = self.redirect.take() {
+                    self.pc = pc;
+                    continue;
+                }
+                let r = self.pop()?;
+                if r == SENTINEL {
+                    return Ok(Stop::Returned);
+                }
+                self.pc = Self::target(r)?;
+                continue;
             }
             let at = code.get(self.pc..).ok_or("pc out of code")?;
             if at.starts_with(&[0x0F, 0x05]) {
@@ -280,6 +373,13 @@ impl Machine {
                 return Ok(stop);
             }
         }
+    }
+
+    /// A code offset from an absolute target address.
+    fn target(addr: u64) -> Result<usize, String> {
+        addr.checked_sub(CODE_BASE)
+            .map(|o| o as usize)
+            .ok_or_else(|| format!("branch to {addr:#x} below the code"))
     }
 
     fn exec(&mut self, i: &Inst, next: usize) -> Result<Option<Stop>, String> {
@@ -409,6 +509,21 @@ impl Machine {
                 } else {
                     (Reg::EAX, Reg::EDX)
                 };
+                // Widening multiplies set CF and OF when the high half is
+                // significant (nonzero for mul, not the sign fill of the low
+                // half for imul); division leaves the flags undefined.
+                match m {
+                    M::Mul => {
+                        self.flags.cf = hi != 0;
+                        self.flags.of = hi != 0;
+                    }
+                    M::Imul => {
+                        let fill = if sign(lo, bits) { mk } else { 0 };
+                        self.flags.cf = hi != fill;
+                        self.flags.of = hi != fill;
+                    }
+                    _ => {}
+                }
                 self.set_reg(rax, lo);
                 self.set_reg(rdx, hi);
             }
@@ -463,7 +578,7 @@ impl Machine {
             }
             M::Jmp => match ops[0] {
                 Operand::Rel(d) => self.pc = (at as i64 + d) as usize,
-                ref other => self.pc = (self.get(other, 64, next)? - CODE_BASE) as usize,
+                ref other => self.pc = Self::target(self.get(other, 64, next)?)?,
             },
             M::Call => {
                 if self.regs[4] % 16 != 0 {
@@ -474,7 +589,7 @@ impl Machine {
                 }
                 let target = match ops[0] {
                     Operand::Rel(d) => (at as i64 + d) as usize,
-                    ref other => (self.get(other, 64, next)? - CODE_BASE) as usize,
+                    ref other => Self::target(self.get(other, 64, next)?)?,
                 };
                 self.push(CODE_BASE + next as u64)?;
                 self.pc = target;
@@ -484,7 +599,7 @@ impl Machine {
                 if r == SENTINEL {
                     return Ok(Some(Stop::Returned));
                 }
-                self.pc = (r - CODE_BASE) as usize;
+                self.pc = Self::target(r)?;
             }
             M::Push => {
                 let v = self.get(&ops[0], 64, next)?;
@@ -526,3 +641,7 @@ pub fn run(code: &[u8], entry: usize, init: &[(usize, u64)]) -> (Machine, Result
     let stop = m.run(code, entry);
     (m, stop)
 }
+
+pub mod irgen;
+pub mod load;
+pub mod native;

@@ -1,7 +1,7 @@
 # backend-lang &mdash; API Reference
 
 > Complete reference for every public item in `backend-lang`, with examples.
-> **Status: 0.2 (pre-1.0).** The surface is designed across the 0.x series
+> **Status: 0.3 (pre-1.0).** The surface is designed across the 0.x series
 > and frozen at `1.0.0`. See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
@@ -12,12 +12,27 @@
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Concepts](#concepts)
+  - [The pipeline](#the-pipeline)
+  - [Value representation](#value-representation)
+  - [Policies, errors, and traps](#policies-errors-and-traps)
+  - [Calls, safepoints, and stack maps](#calls-safepoints-and-stack-maps)
   - [Machine IR](#machine-ir)
   - [Registers and classes](#registers-and-classes)
   - [Operand rules and implicit operands](#operand-rules-and-implicit-operands)
   - [Block parameters and parallel copies](#block-parameters-and-parallel-copies)
   - [Frames](#frames)
   - [Emission](#emission)
+- [`compile`](#compile)
+  - [`Options`](#options)
+  - [`Compiled`, `DataObject`](#compiled)
+  - [`CompileError`](#compileerror)
+  - [`compile_function`](#compile_function)
+- [`isel`](#isel)
+  - [`select`, `IselError`](#select)
+- [`regalloc`](#regalloc)
+  - [`allocate`, `allocate_with`](#allocate)
+  - [`Options`, `Allocation`, `Location`](#regalloc-options)
+  - [`RegAllocError`](#regallocerror)
 - [`emit`](#emit)
 - [Registers: `PReg`, `VReg`, `Reg`, `RegClass`, `RegSet`](#registers)
 - [`mir`](#mir)
@@ -26,6 +41,8 @@
   - [`SlotKind`](#slotkind)
   - [`Operand`, `Mem`, `Scale`, `BlockCall`](#operand)
   - [`Effects`, `Implicit`, `ImplicitKind`](#effects)
+  - [Call sites: `CallSite`](#callsite)
+  - [`Function::verify_ssa`](#functionverify_ssa)
   - [`MirError`](#mirerror)
   - [Text form](#text-form)
 - [`target`](#target-module)
@@ -52,15 +69,22 @@
   - [`op`: the instruction table](#op)
   - [`Emitter`](#emitter)
   - [`Program`, `FunctionInfo`](#program)
+  - [`EmittedFunction`, `CallSiteRecord`](#emittedfunction)
+  - [`Reloc`, `RelocKind`](#reloc)
   - [`EmitError`](#emiterror)
 - [Feature flags](#feature-flags)
 - [Limits](#limits)
-- [What 0.2 does not do](#what-02-does-not-do)
+- [What 0.3 does not do](#what-03-does-not-do)
 
 ## Overview
 
 | Item | Kind | Purpose |
 |---|---|---|
+| [`compile`](#compile) | fn | **Tier 1.** An ir-lang module to x86-64 code, symbols, relocations, and data. |
+| [`Options`](#options) | struct | Convention, frame pointer, runtime symbols, switch and allocation settings. |
+| [`Compiled`](#compiled) | struct | The compiled module. |
+| [`isel::select`](#select) | fn | One ir-lang function to MIR on virtual registers. |
+| [`regalloc::allocate`](#allocate) | fn | Virtual registers to physical registers and stack slots. |
 | [`emit`](#emit) | fn | Emit one physical-register function to x86-64 machine code. |
 | [`mir::Function`](#function) | struct | A machine function: blocks of target instructions. |
 | [`target::Target`](#target) | struct | An ISA as data: registers, classes, instructions. |
@@ -73,17 +97,40 @@
 
 ```toml
 [dependencies]
-backend-lang = "0.2"
+backend-lang = "0.3"
 ```
 
 For `no_std` targets (the crate needs only `alloc`):
 
 ```toml
 [dependencies]
-backend-lang = { version = "0.2", default-features = false }
+backend-lang = { version = "0.3", default-features = false }
 ```
 
+ir-lang is re-exported as `backend_lang::ir_lang`, so the module type the
+backend reads is always the one it was built against.
+
 ## Quick start
+
+```rust
+use backend_lang::Options;
+use ir_lang::{Linkage, Module, Overflow, Signature, Type};
+
+let mut m = Module::new("demo");
+let sig = Signature::new(&[Type::I64, Type::I64], &[Type::I64]);
+let f = m.declare_function("add", &sig, Linkage::Export)?;
+let mut b = m.build(f)?;
+let (x, y) = (b.param(0)?, b.param(1)?);
+let s = b.add(x, y, Overflow::Wrap)?;
+b.ret(&[s])?;
+
+let c = backend_lang::compile(&m, &Options::sysv().with_frame_pointer(false))?;
+// add rdi, rsi; mov rax, rdi; ret
+assert_eq!(c.code(), [0x48, 0x01, 0xF7, 0x48, 0x89, 0xF8, 0xC3]);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+On MIR you write yourself, physical registers and all:
 
 ```rust
 use backend_lang::mir::{Effects, Function, Operand};
@@ -99,6 +146,74 @@ assert_eq!(backend_lang::emit(&f)?, [0xB8, 42, 0, 0, 0, 0xC3]);
 ```
 
 ## Concepts
+
+### The pipeline
+
+[`compile`](#compile) validates the module, then for each defined function:
+
+1. **Selection** ([`isel::select`](#select)): ir-lang blocks and block
+   parameters map one to one to MIR blocks and parameters; each instruction
+   becomes target instructions on virtual registers, with physical registers
+   only in short block-local ranges (argument and result registers around
+   calls and returns, `rdx:rax` around a division, `rcx` for a shift).
+2. **Allocation** ([`regalloc::allocate`](#allocate)): virtual registers to
+   physical registers, spilling to stack slots where needed; every edge's
+   arguments stay a parallel copy.
+3. **Emission** ([`Emitter`](#emitter)): frames, parallel copies, encoding,
+   branch relaxation, calls between the module's functions, and relocations
+   for everything defined elsewhere.
+
+### Value representation
+
+Every integer, `bool`, `ptr`, and `ref` value lives in one general-purpose
+register. A value narrower than 64 bits occupies the low bits with the bits
+above its width **unspecified**, exactly as x86-64's 32-bit instructions
+leave them; arithmetic on 8- and 16-bit types runs at 32 bits. Wherever the
+upper bits matter (comparisons, division, right shifts, overflow checks,
+widening conversions, switch values, array indices) the value is extended
+first by its type's signedness. `bool` is always exactly 0 or 1; booleans
+from outside (parameters, call results, loads) are normalized. At call
+boundaries 8- and 16-bit values are extended to 32 bits, as C compilers
+expect; 32-bit values follow the platform rule (upper half unspecified).
+
+### Policies, errors, and traps
+
+Every integer operation is selected under every policy ir-lang can carry:
+
+- `wrap` computes modulo the width;
+- `trap` branches to a per-function trap block that calls
+  [`Options::trap_symbol`](#options) with the OPS code in the first argument
+  register (followed by `ud2`, in case the handler returns);
+- `error` (only inside a `check` terminator) branches to the error edge,
+  passing the OPS code as `err`.
+
+Overflow is read from the flags at 32 and 64 bits and from an exact 32-bit
+result plus a range check at 8 and 16 bits; unsigned multiplication checks
+the high half. Division tests zero and then `MIN / -1` before it divides, so
+the processor never faults. Shifts mask the amount (`mask`) or check it
+(`error`: `0 <= n < width`, a negative signed amount failing too).
+
+### Calls, safepoints, and stack maps
+
+A call places stack arguments at `[rsp + offset]` in the caller's outgoing
+area, register arguments by one parallel copy, calls, and copies the results
+out of the return registers. The convention comes from the signature's tag:
+`sysv64` and `win64` as named, `c` and `fast` as [`Options::abi`](#options).
+
+**Stack maps** follow ir-lang's statepoint model (IR.md §9): at a safepoint
+(a call or `invoke` that is not `nogc`, or a `safepoint` instruction) the
+references live across it are exactly its GC list. Each is stored into a
+root slot before the call and reloaded after it as the relocated value, so
+no reference is in a register while a collector runs. The call's
+[`CallSiteRecord`](#emittedfunction) lists the root slots as offsets from
+`rsp` at the call, keyed by the return address; a collector reads and
+rewrites the references there.
+
+**`invoke`** records its landing pad on the call site. The unwinder enters
+the pad's stub with the frame as it was at the call (callee-saved registers
+restored) and the exception payload in `rax`; the stub reloads the relocated
+references and jumps to the IR landing pad. This release produces no unwind
+tables (see [What 0.3 does not do](#what-03-does-not-do)).
 
 ### Machine IR
 
@@ -165,6 +280,365 @@ instruction through isa-lang. A conditional branch whose taken edge carries
 moves branches around them on the negated condition, so critical edges need
 no extra block. Functions call each other by name; [`Emitter::finish`](#emitter)
 patches the calls.
+
+## `compile`
+
+```text
+pub fn compile(module: &ir_lang::Module, options: &Options) -> Result<Compiled, CompileError>
+```
+
+Compiles every defined function of `module` into one code buffer:
+validation, instruction selection, register allocation, and emission. Calls
+between the module's functions are resolved; imports, globals, and the
+runtime entry points the code calls are left as [`Reloc`](#reloc)s (a symbol
+the module defines itself is resolved, so a module may provide its own trap
+handler). Globals become [`DataObject`](#compiled)s.
+
+**Errors:** [`CompileError`](#compileerror), naming the function.
+
+```rust
+use backend_lang::{Options, x86_64::RelocKind};
+use ir_lang::{Global, Linkage, Module, Signature, Type};
+
+let mut m = Module::new("m");
+let counter = m.declare_global("counter", Global::bytes(&[5, 0, 0, 0], 4).mutable())?;
+let f = m.declare_function("get", &Signature::new(&[], &[Type::I32]), Linkage::Export)?;
+let mut b = m.build(f)?;
+let p = b.global_addr(counter)?;
+let v = b.load(Type::I32, p, ir_lang::MemFlags::new(4))?;
+b.ret(&[v])?;
+
+let c = backend_lang::compile(&m, &Options::sysv())?;
+let r = &c.relocations()[0];
+assert_eq!((r.kind, r.symbol.as_str()), (RelocKind::Pc32, "counter"));
+assert_eq!(c.data()[0].name(), "counter");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+<a id="options"></a>
+
+### `Options`
+
+`#[non_exhaustive]`, `Clone`, `Copy`. Public fields, set with the `with_*`
+builders:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `abi: &'static Abi` | host (`WIN64` on Windows, else `SYSV`) | The platform C convention, used for the `c` and `fast` tags and for runtime calls. |
+| `frame_pointer: bool` | `true` | Keep `rbp` as a frame pointer; `false` gives it to the allocator. |
+| `trap_symbol` | `"__lexersketch_trap"` | Called by `trap` and trapping policies with the OPS code; never returns. |
+| `gc_poll_symbol` | `"__lexersketch_gc_poll"` | Called by `safepoint`; a safepoint with a stack map. |
+| `resume_symbol` | `"__lexersketch_resume"` | Called by `resume` with the payload; never returns. |
+| `jump_table_min_cases` | `4` | The fewest cases a switch needs for a jump table. |
+| `jump_table_max_spread` | `3` | A table is used when the case range is at most this many entries per case (and at most 65,536 entries). |
+| `regalloc: regalloc::Options` | default | Allocation settings. |
+
+Constructors: `sysv()`, `win64()`, `host()`, `with_abi(&Abi)`; builders
+`with_frame_pointer`, `with_runtime(trap, gc_poll, resume)`,
+`with_jump_tables(min_cases, max_spread)`, `with_regalloc`. `Default` is
+`host()`.
+
+```rust
+use backend_lang::Options;
+
+let o = Options::win64().with_frame_pointer(false).with_jump_tables(u32::MAX, 1);
+assert_eq!(o.abi.name(), "win64");
+assert_eq!(o.jump_table_min_cases, u32::MAX); // switches always become compare trees
+```
+
+<a id="compiled"></a>
+
+### `Compiled`, `DataObject`
+
+`Compiled` (`Clone`, `PartialEq`, `Eq`):
+
+| Method | Returns |
+|---|---|
+| `code()` | Every function's machine code, back to back, in module order. |
+| `program()` | The [`Program`](#program) (code, symbols, functions, relocations). |
+| `functions()` | Each [`EmittedFunction`](#emittedfunction): name, offset, size, frame, call-site records. |
+| `function(name)` | One of them by name (`O(log n)`). |
+| `relocations()` | The code's [`Reloc`](#reloc)s against symbols defined elsewhere, in code order. |
+| `data()` | The module's globals (imports excluded), in module order. |
+| `imports()` | The symbols the code and data refer to that the module does not define, in name order. |
+| `exports()` | The functions and globals with `export` linkage, in name order. |
+
+`DataObject`: `name()`, `size()`, `align()`, `mutable()` (else read-only
+data), `exported()`, `bytes()` (`None` for zero-filled), `relocations()`
+(`Abs64` relocations at offsets from the object's start, for addresses
+stored in it).
+
+```rust
+use backend_lang::Options;
+use ir_lang::{Global, Module};
+
+let mut m = Module::new("m");
+let _ = m.declare_global("answer", Global::bytes(&[42, 0, 0, 0], 4))?;
+let c = backend_lang::compile(&m, &Options::sysv())?;
+let d = &c.data()[0];
+assert_eq!((d.name(), d.size(), d.align(), d.mutable()), ("answer", 4, 4, false));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+<a id="compileerror"></a>
+
+### `CompileError`
+
+`#[non_exhaustive]`, `Clone`, `PartialEq`, `Display`, `Error` (with
+`source`).
+
+| Variant | Meaning |
+|---|---|
+| `Invalid(ir_lang::ValidationError)` | The module does not validate. |
+| `Select { function, error: IselError }` | Selection failed or refused a construct. |
+| `Allocate { function, error: RegAllocError }` | Register allocation failed. |
+| `Emit { function: Option<String>, error: EmitError }` | Emission failed (`None` when it belongs to no one function). |
+
+```rust
+use backend_lang::{CompileError, Options};
+use ir_lang::{Linkage, Module, Signature, Type};
+
+let mut m = Module::new("m");
+let f = m.declare_function("f", &Signature::new(&[], &[Type::F64]), Linkage::Export)?;
+let mut b = m.build(f)?;
+let x = b.f64const(1.5)?;
+b.ret(&[x])?;
+let err = backend_lang::compile(&m, &Options::sysv()).unwrap_err();
+assert!(matches!(err, CompileError::Select { .. }));
+assert!(err.to_string().contains("P11")); // floating point waits on isa-lang SSE
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+<a id="compile_function"></a>
+
+### `compile_function`
+
+```text
+pub fn compile_function(module: &Module, func: FuncId, options: &Options) -> Result<mir::Function, CompileError>
+```
+
+Selects and allocates one function and returns its MIR on physical
+registers, ready for [`emit`](#emit) or an [`Emitter`](#emitter); its text
+form shows exactly what was selected and allocated.
+
+```rust
+use backend_lang::Options;
+use ir_lang::{Linkage, Module, Signature, Type};
+
+let mut m = Module::new("m");
+let f = m.declare_function("seven", &Signature::new(&[], &[Type::I32]), Linkage::Export)?;
+let mut b = m.build(f)?;
+let k = b.iconst(Type::I32, 7)?;
+b.ret(&[k])?;
+let mir = backend_lang::compile_function(&m, f, &Options::sysv())?;
+assert!(mir.to_string().contains("rax"));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## `isel`
+
+<a id="select"></a>
+
+### `select`, `IselError`
+
+```text
+pub fn select(module: &Module, func: FuncId, options: &Options) -> Result<mir::Function, IselError>
+```
+
+Selects one function of a module (validated first) into a MIR function on
+virtual registers, named after it, under the convention its signature's tag
+selects. The result satisfies [`regalloc::allocate`](#allocate)'s
+precondition.
+
+What is selected:
+
+| ir-lang | Selected as |
+|---|---|
+| `add sub mul` | `add`/`sub`/`imul` at 32 or 64 bits; overflow from OF/CF, from an exact 32-bit result at 8/16 bits, or from the high half for unsigned multiplication. Commutative operands are ordered so that an operand used only here is the one overwritten (a constant goes right, as an immediate). |
+| `div rem floor_div floor_mod` | Zero and `MIN / -1` tested first; `div`/`idiv` through `rdx:rax`; floor variants fixed up with `cmov`. |
+| `and or xor not neg abs min max` | ALU ops, `neg` + `cmov` for `abs`, `cmp` + `cmov` for `min`/`max`. |
+| `shl shr` | By immediate when constant and in range, else by `cl`, masked or range-checked. |
+| `eq ne lt le gt ge`, `select` | `cmp` fused into the branch or `cmov` that uses it once in the same block, else `setcc`. |
+| Conversions | `int_cast` (checked by re-extension), `zext`, `sext`, `narrow`, `bitcast`, `bool_to_int`, `ptr_to_int`, `int_to_ptr`, `ref_to_ptr` (free), `char_from_u32` (two compares). |
+| `load`, `store`, atomics | `mov`/`movzx`/`movsx` at every width; constant offsets folded into the memory operand; `atomic_load`/`atomic_store` as plain moves (TSO), `seq_cst` stores and `atomic_rmw xchg` as `xchg`, `fence seq_cst` as a locked `xchg` on a private slot. |
+| Addresses | `stack_addr` (rounded up at run time for alignment above 16), `global_addr`/`func_addr` (RIP-relative `lea`), `field_addr`, `elem_addr` (scaled `lea` or `imul`), `ptr_offset`. |
+| `memcpy memmove memset` | Eight-byte loops then byte loops; `memmove` picks the direction by address order. |
+| `call`, `call_indirect`, `tail_call`, `safepoint` | As in [Calls, safepoints, and stack maps](#calls-safepoints-and-stack-maps); an indirect tail call goes through `r11`. |
+| `jump br switch ret unreachable trap` | `jmp`, `jcc`; `switch` as a bounds-checked jump table when dense ([`Options`](#options)), else a balanced compare tree; `ret` through the return registers; `ud2`; a call to the trap handler. |
+| `check`, `invoke`, `resume` | The operation with its failure branching to the error edge; a call with a landing pad; a call to `resume_symbol`. |
+
+`IselError` (`#[non_exhaustive]`, `Clone`, `PartialEq`, `Display`,
+`Error`):
+
+| Variant | Meaning |
+|---|---|
+| `Invalid(ValidationError)` | The module does not validate. |
+| `NoBody(FuncId)` | The handle is not in the module, or it is an import. |
+| `Unsupported { func, what }` | A construct this release does not select; `what` names what it waits on. |
+| `Mir(MirError)` | Building the MIR failed (a 32-bit table limit). |
+
+Refused today, each as `Unsupported`: floating-point types and operations
+(isa-lang SSE, ISSUES P11); `atomic_rmw` other than `xchg`, and `cmpxchg`
+(`lock`-prefixed forms); the `aapcs64` convention (the AArch64 target);
+32-bit pointer modules; more results than return registers (two under
+SysV, one under Win64); a tail call needing more stack-argument space than
+its caller received.
+
+```rust
+use backend_lang::Options;
+use ir_lang::{Linkage, Module, Overflow, Signature, Type};
+
+let mut m = Module::new("m");
+let f = m.declare_function("inc", &Signature::new(&[Type::I64], &[Type::I64]), Linkage::Export)?;
+let mut b = m.build(f)?;
+let x = b.param(0)?;
+let one = b.iconst(Type::I64, 1)?;
+let y = b.add(x, one, Overflow::Wrap)?;
+b.ret(&[y])?;
+let mir = backend_lang::isel::select(&m, f, &Options::sysv())?;
+assert!(mir.to_string().contains("add64"));
+mir.verify_ssa()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## `regalloc`
+
+SSA register allocation, in place: virtual registers to physical registers
+and stack slots.
+
+**Input:** a MIR function in SSA form (one definition per virtual register,
+every use dominated by its definition: [`verify_ssa`](#functionverify_ssa))
+in which physical registers appear only in block-local ranges, plus the
+entry block's incoming arguments. [`isel::select`](#select) produces exactly
+this. **Output:** the same function on physical registers, ready for
+[`emit`](#emit).
+
+**Algorithm.** Liveness by SSA path exploration (from each use outside its
+definition's block, walk predecessors up to the definition), budgeted.
+Constraints in one backward walk per block: last uses, physical registers
+live after each instruction, and every register written while each value is
+live (call clobbers, fixed-register definitions), which the value must
+avoid. Coloring in dominance order: in strict SSA, interfering values have
+one definition dominating the other, so giving each value, at its
+definition, a register no live value holds is a correct coloring, with no
+interference graph. Coalescing by affinity classes (union-find over copies,
+two-address ties, and block parameters with their arguments) and hints
+toward the fixed registers values are copied to or from; best effort. When
+no register is free at a definition, the lightest of the definition and the
+values in usable registers (uses per instruction spanned) is spilled for its
+whole life: constants and addresses are rematerialized at each use, other
+values stored once after their definition and read from the slot directly
+where the instruction takes a memory operand, else through a reload
+temporary. The allocation then reruns; after [`MAX_ROUNDS`](#regalloc-options)
+rounds every remaining long-lived value is spilled, which always succeeds.
+Callee-saved registers are ordinary registers: a value live across a call can
+only sit in one, and the frame saves exactly those written.
+
+<a id="allocate"></a>
+
+### `allocate`, `allocate_with`
+
+```text
+pub fn allocate(f: &mut Function) -> Result<Allocation, RegAllocError>
+pub fn allocate_with(f: &mut Function, options: &Options) -> Result<Allocation, RegAllocError>
+```
+
+**Errors:** [`RegAllocError`](#regallocerror); `f` is unspecified after an
+error.
+
+```rust
+use backend_lang::mir::{Effects, Function};
+use backend_lang::regalloc;
+use backend_lang::x86_64::{op, GPR, SYSV, RAX, RDI, RSI};
+
+// fn add(a, b) -> a + b, on virtual registers.
+let mut f = Function::new("add", &SYSV);
+f.omit_frame_pointer();
+let b = f.block()?;
+f.add_param(b, RDI.into())?;
+f.add_param(b, RSI.into())?;
+let (x, y, s) = (f.vreg(GPR)?, f.vreg(GPR)?, f.vreg(GPR)?);
+f.push(b, op::PCOPY, &[x.into(), y.into(), RDI.into(), RSI.into()])?;
+f.push(b, op::ADD64, &[s.into(), x.into(), y.into()])?;
+f.push(b, op::COPY, &[RAX.into(), s.into()])?;
+f.push_with(b, op::RET, &[], Effects::new().uses(&[RAX]))?;
+let a = regalloc::allocate(&mut f)?;
+assert_eq!((a.rounds(), a.spilled()), (1, 0));
+let code = backend_lang::emit(&f)?;
+assert_eq!(code.last(), Some(&0xC3));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+<a id="regalloc-options"></a>
+
+### `Options`, `Allocation`, `Location`
+
+`regalloc::Options` (`#[non_exhaustive]`, `Copy`): `live_budget` (default
+[`DEFAULT_LIVE_BUDGET`] = 2^24 live-set entries, 64 MiB) and
+`keep_assignment` (keep a copy of the final virtual function and its
+locations, for checking an allocation independently). Builders
+`new()`, `with_live_budget(n)`, `keep_assignment(bool)`.
+
+`Allocation`: `rounds()` (1 when nothing spilled), `spilled()`,
+`rematerialized()`, `max_pressure()` (the most values of one class live at
+once in the final round), and `assignment()` (with `keep_assignment`: the
+final virtual function and each virtual register's `Location`).
+
+`Location` (`#[non_exhaustive]`): `None` (never live), `Reg(PReg)`,
+`Slot(StackSlot)`.
+
+`MAX_ROUNDS` = 6: after this many rounds that still spill, every long-lived
+value is spilled at once.
+
+```rust
+use backend_lang::mir::Operand;
+use backend_lang::mir::Function;
+use backend_lang::regalloc::{self, Location, Options};
+use backend_lang::x86_64::{op, GPR, SYSV};
+
+let mut f = Function::new("f", &SYSV);
+let b = f.block()?;
+let v = f.vreg(GPR)?;
+f.push(b, op::MOV64RI, &[v.into(), Operand::Imm(7)])?;
+f.push(b, op::CMP64, &[v.into(), Operand::Imm(1)])?;
+f.push(b, op::RET, &[])?;
+let a = regalloc::allocate_with(&mut f, &Options::new().keep_assignment(true))?;
+let (_, locs) = a.assignment().unwrap();
+assert!(matches!(locs[0], Location::Reg(_)));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+<a id="regallocerror"></a>
+
+### `RegAllocError`
+
+`#[non_exhaustive]`, `Copy`, `Display`, `Error`.
+
+| Variant | Meaning |
+|---|---|
+| `Mir(MirError)` | The function is malformed or not in SSA form. |
+| `PhysLiveIn { block, reg }` | A physical register is live into a block other than through the entry's parameters. |
+| `PhysClobbered { block, reg }` | An instruction writes a physical register holding a live value (two fixed-register ranges overlap). |
+| `TooLarge` | The live sets exceed `live_budget`. |
+| `NoRegister { class }` | No register of the class can hold a value even after spilling everything spillable. |
+
+```rust
+use backend_lang::mir::{Function, Operand};
+use backend_lang::regalloc::{self, Options, RegAllocError};
+use backend_lang::x86_64::{op, GPR, SYSV};
+
+let mut f = Function::new("f", &SYSV);
+let (a, b) = (f.block()?, f.block()?);
+let v = f.vreg(GPR)?;
+f.push(a, op::MOV64RI, &[v.into(), Operand::Imm(1)])?;
+let to_b = f.block_call(b, &[])?;
+f.push(a, op::JMP, &[to_b.into()])?;
+f.push(b, op::CMP64, &[v.into(), Operand::Imm(0)])?;
+f.push(b, op::RET, &[])?;
+let err = regalloc::allocate_with(&mut f, &Options::new().with_live_budget(0));
+assert_eq!(err.unwrap_err(), RegAllocError::TooLarge);
+# Ok::<(), backend_lang::mir::MirError>(())
+```
 
 ## `emit`
 
@@ -300,8 +774,9 @@ another function are rejected or read as empty, never a panic.
 
 Checks every instruction against its opcode, that every block ends with
 exactly one terminator, and that every virtual register is defined at most
-once. Linear time. Dominance (every use defined on every path) is the
-register allocator's precondition and is checked with it in 0.5.
+once. Linear time. Dominance (every use defined on every path) is checked
+by [`verify_ssa`](#functionverify_ssa), the register allocator's
+precondition.
 
 **Errors:** the first [`MirError`](#mirerror), in block order.
 
@@ -412,6 +887,72 @@ assert!(f.clobbers(call).contains(RAX));
 # Ok::<(), backend_lang::mir::MirError>(())
 ```
 
+<a id="callsite"></a>
+
+### Call sites: `CallSite`
+
+```text
+impl Function {
+    pub fn set_call_site(&mut self, call: Inst, gc_slots: &[StackSlot], landing_pad: Option<Block>) -> Result<(), MirError>;
+    pub fn call_site(&self, inst: Inst) -> Option<CallSite<'_>>;
+    pub fn call_sites(&self) -> impl ExactSizeIterator<Item = CallSite<'_>>;
+}
+```
+
+A call may carry a record: the stack slots holding its GC roots while it
+runs (its stack map) and the landing pad unwinding through it reaches. The
+landing pad counts as a successor of the call's block for liveness and
+dominance. `CallSite`: `inst()`, `gc_slots()`, `landing_pad()`. The emitter
+turns each into a [`CallSiteRecord`](#emittedfunction).
+
+**Errors:** `MirError::NotACall` if `call` is not a call;
+`UnknownSlot`/`UnknownBlock` for foreign ids.
+
+```rust
+use backend_lang::mir::{Function, SlotKind};
+use backend_lang::x86_64::{op, SYSV};
+
+let mut f = Function::new("f", &SYSV);
+let root = f.stack_slot(SlotKind::Local { size: 8, align: 8 })?;
+let b = f.block()?;
+let poll = f.symbol("gc_poll")?;
+let call = f.push(b, op::CALL, &[poll.into()])?;
+f.push(b, op::RET, &[])?;
+f.set_call_site(call, &[root], None)?;
+assert_eq!(f.call_site(call).unwrap().gc_slots(), [root]);
+# Ok::<(), backend_lang::mir::MirError>(())
+```
+
+<a id="functionverify_ssa"></a>
+
+### `Function::verify_ssa`
+
+[`verify`](#functionverify), then SSA dominance: in every block reachable
+from the entry, each use of a virtual register is dominated by its
+definition (a use in the defining block comes after it; a branch argument
+is a use at the end of its block). Linear: dominators by Lengauer and
+Tarjan's algorithm (iterative, `O(m log n)` on any graph), then an `O(1)`
+interval test per use on the dominator tree.
+
+**Errors:** `verify`'s, then `MirError::UndefinedVReg` or
+`MirError::NotDominated`.
+
+```rust
+use backend_lang::mir::{Function, MirError};
+use backend_lang::x86_64::{op, GPR, SYSV};
+
+let mut f = Function::new("f", &SYSV);
+let (a, b) = (f.block()?, f.block()?);
+let v = f.vreg(GPR)?;
+let to_b = f.block_call(b, &[])?;
+f.push(a, op::JMP, &[to_b.into()])?;
+let w = f.vreg(GPR)?;
+f.push(b, op::MOV64, &[w.into(), v.into()])?; // v is never defined
+f.push(b, op::RET, &[])?;
+assert!(matches!(f.verify_ssa(), Err(MirError::UndefinedVReg { .. })));
+# Ok::<(), MirError>(())
+```
+
 ### `MirError`
 
 `#[non_exhaustive]`, `Copy`, `Display`, `Error`. Every variant names where
@@ -431,6 +972,9 @@ the problem is.
 | `BadParam { block }` / `BadArg { block }` | A parameter or argument of an unsupported shape. |
 | `UnknownVReg`, `UnknownPReg`, `UnknownSlot`, `UnknownBlock`, `UnknownSymbol`, `UnknownClass` | An id the function or target does not have. |
 | `MultipleDefs { vreg }` | A virtual register defined twice (SSA). |
+| `NotACall { inst }` | A call-site record names an instruction that is not a call. |
+| `UndefinedVReg { vreg }` | A virtual register used but never defined (`verify_ssa`). |
+| `NotDominated { vreg, inst }` | A use not dominated by its definition (`verify_ssa`). |
 | `MissingTerminator { block }` / `MisplacedTerminator { inst }` | Block structure. |
 | `NoBlocks` | An empty function. |
 | `Limit` | A table would exceed its 32-bit ids. |
@@ -799,6 +1343,8 @@ form is tied to the definition.
 | Shifts | `SHL SHR SAR ROL ROR` × `32 64`, by immediate or `…CL` |
 | Conditions | `SETCC CMOV32 CMOV64` |
 | Control | `JMP JCC CALL RET UD2 INT3 NOP SYSCALL` |
+| Tail calls, tables, pads | `TAILCALL` (epilogue, then a jump to a symbol or register), `JMPTBL` (`%t = jmptbl %i, b0, b1, …`: a table of offsets after the function; `%i` already in range; `%t` written before `%i` is last read), `LANDINGPAD` (emits nothing; defines `rax`, where the payload arrives) |
+| Atomics | `XCHG8 XCHG16 XCHG32 XCHG64` (with memory: implicitly locked, a full barrier) |
 
 `SYSCALL` is emitted as the bytes `0f 05` (isa-lang 0.2 has no form for it).
 `push` and `pop` are not MIR instructions: the stack pointer is fixed
@@ -816,8 +1362,10 @@ impl Emitter {
 ```
 
 `function` verifies and emits one function at the current end of the code;
-`finish` relaxes branches, patches calls by name, and reports names called
-but never emitted.
+`declare_external(name)` marks a name as defined elsewhere, so calls, tail
+calls, and addresses of it become [`Reloc`](#reloc)s; `finish` relaxes
+branches, patches calls and jump tables, and reports names called but
+neither emitted nor declared external.
 
 ```rust
 use backend_lang::mir::{Effects, Function, Operand};
@@ -851,6 +1399,72 @@ assert!(program.symbol("seven").unwrap() > 0);
 (name order). `FunctionInfo`: `frame()`, the laid-out frame (including any
 hidden slots the edge moves used, numbered after the function's own).
 
+<a id="emittedfunction"></a>
+
+### `EmittedFunction`, `CallSiteRecord`
+
+`Program::functions()` lists each `EmittedFunction` in emission order:
+`name()`, `offset()`, `size()`, `frame()` (its [`FrameLayout`](#framelayout)),
+and `call_sites()`. A `CallSiteRecord` has `return_offset()` (the offset of
+the instruction after the call, from the start of the code: the key a stack
+walker looks up), `gc_slots()` (the stack map: one 8-byte reference per
+entry, at byte offsets from the caller's `rsp` at the call, before the return
+address is pushed), and `landing_pad()` (the pad's offset, if any).
+
+```rust
+use backend_lang::mir::{Function, SlotKind};
+use backend_lang::x86_64::{op, Emitter, SYSV};
+
+let mut f = Function::new("f", &SYSV);
+let root = f.stack_slot(SlotKind::Local { size: 8, align: 8 })?;
+let b = f.block()?;
+let g = f.symbol("f")?;
+let call = f.push(b, op::CALL, &[g.into()])?;
+f.push(b, op::RET, &[])?;
+f.set_call_site(call, &[root], None)?;
+let mut e = Emitter::new();
+e.function(&f)?;
+let p = e.finish()?;
+let site = &p.functions()[0].call_sites()[0];
+assert_eq!(site.gc_slots().len(), 1);
+assert!(site.return_offset() > 0);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+<a id="reloc"></a>
+
+### `Reloc`, `RelocKind`
+
+`Reloc` (`#[non_exhaustive]`, public fields `offset`, `kind`, `symbol`,
+`addend`): the bytes at `offset` receive what `kind` computes from the
+symbol's address `S`, the addend `A`, and the patched place `P`; they hold
+zero until linked. `RelocKind` (`#[non_exhaustive]`), with `size()`:
+
+| Kind | Value | ELF | object-lang 0.2 |
+|---|---|---|---|
+| `Call32` | `S + A - P`, 32 bits (a `call`/`jmp` displacement) | `R_X86_64_PLT32` | `X86_64Reloc::Plt32` |
+| `Pc32` | `S + A - P`, 32 bits (a RIP-relative address) | `R_X86_64_PC32` | `X86_64Reloc::Pc32` |
+| `Abs64` | `S + A`, 64 bits (an address stored in data) | `R_X86_64_64` | `X86_64Reloc::Abs64` |
+
+```rust
+use backend_lang::mir::Function;
+use backend_lang::x86_64::{op, Emitter, RelocKind, SYSV};
+
+let mut f = Function::new("f", &SYSV);
+f.omit_frame_pointer();
+let b = f.block()?;
+let puts = f.symbol("puts")?;
+f.push(b, op::CALL, &[puts.into()])?;
+f.push(b, op::RET, &[])?;
+let mut e = Emitter::new();
+e.declare_external("puts")?;
+e.function(&f)?;
+let p = e.finish()?;
+let r = &p.relocations()[0];
+assert_eq!((r.kind, r.symbol.as_str(), r.addend), (RelocKind::Call32, "puts", -4));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ### `EmitError`
 
 `#[non_exhaustive]`, `Clone`, `Display`, `Error` (with `source`).
@@ -869,6 +1483,8 @@ hidden slots the edge moves used, numbered after the function's own).
 | `Asm(AsmError)` | The assembler failed (code beyond 2 GiB). |
 | `UndefinedSymbol(name)` / `DuplicateSymbol(name)` | Linking by name. |
 | `ProbeScratch` | A probe loop needs `r10` or `r11`, and both carry entry values. |
+| `Constraint { inst }` | A table branch's temporary is its index register, or a tail call's register target is one the epilogue restores. |
+| `ExternalConflict(name)` | A name was both declared external and emitted. |
 
 ## Feature flags
 
@@ -886,19 +1502,32 @@ hidden slots the edge moves used, numbered after the function's own).
 | Frame and slot offsets | `i32` | `FrameError::TooLarge` |
 | Slot alignment | 16 | `FrameError::Alignment` |
 | Code size | 2 GiB (isa-lang) | `EmitError::Asm` |
+| Allocator live sets | `regalloc::Options::live_budget` (default 2^24 entries) | `RegAllocError::TooLarge` |
+| Allocation rounds | `MAX_ROUNDS` + 1 (the last spills every long-lived value) | always allocates, or `NoRegister` |
+| Jump-table entries | 65,536 | a compare tree instead |
 
-## What 0.2 does not do
+## What 0.3 does not do
 
 Recorded with reasons in [`dev/ROADMAP.md`](../dev/ROADMAP.md):
 
-- **Instruction selection** from ir-lang and **SSA register allocation**
-  (spilling, rematerialization, stack maps) arrive in 0.5; instruction
-  selection waits for ir-lang 2.0 (calls, memory, aggregates).
-- **AArch64** and **floating point / SIMD** need isa-lang 0.5's forms.
-- **Aggregates by value, variadic calls, and 128-bit integers** in the
-  conventions come with call lowering (0.5).
-- **Unwind information** (Win64 `.pdata`/`.xdata`, DWARF CFI) and
-  **relocations against external symbols** belong with object-lang and
-  debuginfo-lang; the `FrameLayout` prologue plan is the input they need.
+- **Floating point and SIMD**, and the vector half of the conventions: they
+  need isa-lang's SSE forms (ISSUES P11). Refused as
+  `IselError::Unsupported`.
+- **`atomic_rmw` other than `xchg`, and `cmpxchg`**: they need
+  `lock`-prefixed forms isa-lang 0.2 does not encode. Refused.
+- **`shift = saturate`** (OPS v2): ir-lang 2.0.0-alpha.1 cannot express it
+  (its `Shift` has `error` and `mask`), so there is nothing to select yet.
+- **Unwind tables**: no Win64 `.pdata`/`.xdata`, DWARF CFI, or LSDA, and no
+  personality routine. `invoke` records its landing pad per call site and
+  the pads work under an unwinder that restores the frame as the records
+  and `FrameLayout` describe (the tests carry a minimal one), but no system
+  unwinder can find them yet.
+- **Position-independent code**: data is addressed PC-relative and calls are
+  direct `rel32`; there is no GOT or PLT, so code linked into a shared
+  object cannot reach symbols another object defines.
+- **AArch64** and the `aapcs64` convention; **32-bit pointer** modules.
+- **Aggregates by value, sret, varargs, i128**, and more results than
+  return registers; a tail call needing more stack-argument space than its
+  caller received.
 - **Function alignment** inside one code buffer waits for isa-lang's
   alignment directive.

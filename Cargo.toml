@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "backend-lang"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Machine-code backend core: machine IR, target descriptions, ABI and frame layout, parallel moves, and emission through isa-lang."
+description = "Native backend: instruction selection from ir-lang, SSA register allocation with stack maps, and x86-64 emission through isa-lang."
 
 # Keywords (5 max)
 keywords = ["backend", "codegen", "register-allocation", "compiler", "lexersketch"]
@@ -45,7 +45,7 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = ["isa-lang/std"]
+std = ["isa-lang/std", "ir-lang/std"]
 
 
 # DEPENDENCIES
@@ -54,6 +54,9 @@ std = ["isa-lang/std"]
 # The x86-64 encoder and assembler: MIR is lowered to isa-lang instructions,
 # which own every byte of the encoding (first-party, from crates.io).
 isa-lang = { version = "0.2", default-features = false }
+# The SSA IR instruction selection reads (first-party, from crates.io). The
+# 2.0 line is a pre-release, so it is pinned exactly.
+ir-lang = { version = "=2.0.0-alpha.1", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -63,6 +66,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 # Test-only: wraps emitted code into a static ELF executable for the end-to-end run.
 object-lang = "0.2"
+# Test-only: ir-lang's reference interpreter is the oracle of the
+# differential tests and benchmarks.
+ir-lang = { version = "=2.0.0-alpha.1", features = ["interp"] }
 
 
 # BENCHMARKS

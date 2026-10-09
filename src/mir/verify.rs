@@ -153,6 +153,26 @@ pub enum MirError {
     },
     /// The function has no blocks.
     NoBlocks,
+    /// A call-site record (stack map or landing pad) names an instruction
+    /// that is not a call.
+    NotACall {
+        /// The instruction.
+        inst: Inst,
+    },
+    /// A virtual register is used but never defined
+    /// ([`Function::verify_ssa`]).
+    UndefinedVReg {
+        /// The register.
+        vreg: VReg,
+    },
+    /// A use of a virtual register in a block reachable from the entry is not
+    /// dominated by its definition ([`Function::verify_ssa`]).
+    NotDominated {
+        /// The register.
+        vreg: VReg,
+        /// The instruction that uses it.
+        inst: Inst,
+    },
     /// A table of the function (instructions, operands, blocks, ...) would
     /// exceed its 32-bit ids, or virtual registers would exceed
     /// [`VReg::MAX`].
@@ -239,6 +259,19 @@ impl fmt::Display for MirError {
                 )
             }
             MirError::NoBlocks => f.write_str("the function has no blocks"),
+            MirError::NotACall { inst } => {
+                write!(
+                    f,
+                    "{inst}: a call-site record names an instruction that is not a call"
+                )
+            }
+            MirError::UndefinedVReg { vreg } => {
+                write!(f, "{vreg:?} is used but never defined")
+            }
+            MirError::NotDominated { vreg, inst } => write!(
+                f,
+                "{inst}: the use of {vreg:?} is not dominated by its definition"
+            ),
             MirError::Limit => f.write_str("the function exceeds its 32-bit tables"),
         }
     }
@@ -299,6 +332,38 @@ impl Function {
                 keys.sort_unstable();
                 if keys.windows(2).any(|w| w[0] == w[1]) {
                     return Err(MirError::DuplicateDestination { inst });
+                }
+                Ok(())
+            }
+            InstKind::Switch => {
+                // The fixed operands, then one argument-less target per index.
+                let rules = desc.operands();
+                if operands.len() <= rules.len() {
+                    return Err(MirError::OperandCount {
+                        inst,
+                        expected: rules.len() + 1,
+                        found: operands.len(),
+                    });
+                }
+                let mut mems = 0usize;
+                for (index, (rule, op)) in rules.iter().zip(operands).enumerate() {
+                    self.check_operand(inst, index, *rule, op, rules, &mut mems)?;
+                }
+                for (index, op) in operands.iter().enumerate().skip(rules.len()) {
+                    match op {
+                        Operand::Block(call) => {
+                            self.check_block_call(inst, call)?;
+                            if !call.is_empty() {
+                                return Err(MirError::ArgCount {
+                                    inst,
+                                    block: call.block(),
+                                    expected: 0,
+                                    found: call.len(),
+                                });
+                            }
+                        }
+                        _ => return Err(MirError::OperandShape { inst, index }),
+                    }
                 }
                 Ok(())
             }

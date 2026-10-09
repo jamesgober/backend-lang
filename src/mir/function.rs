@@ -216,6 +216,116 @@ pub(crate) struct InstData {
 
 pub(crate) const NO_CLOBBERS: u32 = u32::MAX;
 
+/// One call-site record: the GC roots of a safepoint call (its stack map) and
+/// the block unwinding lands in, if any.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SiteData {
+    pub(crate) inst: Inst,
+    pub(crate) gc: u32,
+    pub(crate) ngc: u32,
+    pub(crate) landing: Option<Block>,
+}
+
+/// What a call instruction records besides its operands: the stack slots that
+/// hold its GC roots while it runs (its **stack map**), and the **landing
+/// pad** control reaches if the callee unwinds.
+///
+/// # Examples
+///
+/// ```
+/// use backend_lang::mir::{Function, SlotKind};
+/// use backend_lang::x86_64::{op, SYSV};
+///
+/// let mut f = Function::new("f", &SYSV);
+/// let b = f.block()?;
+/// let root = f.stack_slot(SlotKind::Local { size: 8, align: 8 })?;
+/// let g = f.symbol("g")?;
+/// let call = f.push(b, op::CALL, &[g.into()])?;
+/// f.push(b, op::RET, &[])?;
+/// f.set_call_site(call, &[root], None)?;
+/// let site = f.call_site(call).unwrap();
+/// assert_eq!(site.gc_slots(), [root]);
+/// assert_eq!(site.landing_pad(), None);
+/// # Ok::<(), backend_lang::mir::MirError>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallSite<'a> {
+    inst: Inst,
+    gc_slots: &'a [StackSlot],
+    landing_pad: Option<Block>,
+}
+
+impl<'a> CallSite<'a> {
+    /// The call instruction.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::mir::Function;
+    /// use backend_lang::x86_64::{op, SYSV};
+    ///
+    /// let mut f = Function::new("f", &SYSV);
+    /// let b = f.block()?;
+    /// let g = f.symbol("g")?;
+    /// let call = f.push(b, op::CALL, &[g.into()])?;
+    /// f.set_call_site(call, &[], None)?;
+    /// assert_eq!(f.call_site(call).unwrap().inst(), call);
+    /// # Ok::<(), backend_lang::mir::MirError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn inst(&self) -> Inst {
+        self.inst
+    }
+
+    /// The slots holding the GC references live across the call, which a
+    /// collector reads and may rewrite while the callee runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::mir::{Function, SlotKind};
+    /// use backend_lang::x86_64::{op, SYSV};
+    ///
+    /// let mut f = Function::new("f", &SYSV);
+    /// let b = f.block()?;
+    /// let s = f.stack_slot(SlotKind::Local { size: 8, align: 8 })?;
+    /// let g = f.symbol("g")?;
+    /// let call = f.push(b, op::CALL, &[g.into()])?;
+    /// f.set_call_site(call, &[s], None)?;
+    /// assert_eq!(f.call_site(call).unwrap().gc_slots().len(), 1);
+    /// # Ok::<(), backend_lang::mir::MirError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn gc_slots(&self) -> &'a [StackSlot] {
+        self.gc_slots
+    }
+
+    /// The block control reaches when the callee unwinds, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::mir::Function;
+    /// use backend_lang::x86_64::{op, SYSV};
+    ///
+    /// let mut f = Function::new("f", &SYSV);
+    /// let b = f.block()?;
+    /// let pad = f.block()?;
+    /// let g = f.symbol("g")?;
+    /// let call = f.push(b, op::CALL, &[g.into()])?;
+    /// f.set_call_site(call, &[], Some(pad))?;
+    /// assert_eq!(f.call_site(call).unwrap().landing_pad(), Some(pad));
+    /// # Ok::<(), backend_lang::mir::MirError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn landing_pad(&self) -> Option<Block> {
+        self.landing_pad
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BlockData {
     pub(crate) params: Vec<Operand>,
@@ -294,6 +404,9 @@ pub struct Function {
     pub(crate) clobbers: Vec<RegSet>,
     pub(crate) slots: Vec<SlotKind>,
     pub(crate) symbols: Vec<String>,
+    /// Call-site records, sorted by instruction.
+    pub(crate) sites: Vec<SiteData>,
+    pub(crate) site_slots: Vec<StackSlot>,
     outgoing: u32,
     frame_pointer: bool,
 }
@@ -339,6 +452,8 @@ impl Function {
             clobbers: Vec::new(),
             slots: Vec::new(),
             symbols: Vec::new(),
+            sites: Vec::new(),
+            site_slots: Vec::new(),
             outgoing: 0,
             frame_pointer: true,
         }
@@ -900,6 +1015,22 @@ impl Function {
         operands: &[Operand],
         effects: Effects<'_>,
     ) -> Result<Inst, MirError> {
+        let inst = self.create_inst(block, opcode, operands, effects)?;
+        if let Some(b) = self.blocks.get_mut(block.index()) {
+            b.insts.push(inst);
+        }
+        Ok(inst)
+    }
+
+    /// Creates a checked instruction of `block` without placing it in the
+    /// block's list (passes that insert code rebuild the list in one go).
+    pub(crate) fn create_inst(
+        &mut self,
+        block: Block,
+        opcode: Opcode,
+        operands: &[Operand],
+        effects: Effects<'_>,
+    ) -> Result<Inst, MirError> {
         if block.index() >= self.blocks.len() {
             return Err(MirError::UnknownBlock(block));
         }
@@ -942,10 +1073,34 @@ impl Function {
             nimp: nimp as u32,
             clobber,
         });
-        if let Some(b) = self.blocks.get_mut(block.index()) {
-            b.insts.push(inst);
-        }
         Ok(inst)
+    }
+
+    /// Replaces `block`'s instruction list.
+    pub(crate) fn set_block_insts(&mut self, block: Block, insts: Vec<Inst>) {
+        if let Some(b) = self.blocks.get_mut(block.index()) {
+            b.insts = insts;
+        }
+    }
+
+    /// Takes `block`'s instruction list, leaving it empty.
+    pub(crate) fn take_block_insts(&mut self, block: Block) -> Vec<Inst> {
+        self.blocks
+            .get_mut(block.index())
+            .map(|b| core::mem::take(&mut b.insts))
+            .unwrap_or_default()
+    }
+
+    /// Replaces `block`'s parameter list.
+    pub(crate) fn set_params(&mut self, block: Block, params: Vec<Operand>) {
+        if let Some(b) = self.blocks.get_mut(block.index()) {
+            b.params = params;
+        }
+    }
+
+    /// The index of `inst`'s first operand in the operand pool.
+    pub(crate) fn operand_base(&self, inst: Inst) -> usize {
+        self.insts.get(inst.index()).map_or(0, |d| d.ops as usize)
     }
 
     /// The instructions of `block`, in order (empty for a block the function
@@ -1106,6 +1261,123 @@ impl Function {
             .and_then(|d| self.clobbers.get(d.clobber as usize))
             .copied()
             .unwrap_or(RegSet::EMPTY)
+    }
+
+    /// Records what a call instruction carries besides its operands: the
+    /// stack slots holding its GC roots (its stack map: a collector running
+    /// during the call finds the references there and may update them), and
+    /// the block control reaches if the callee unwinds. Setting it again
+    /// replaces the record.
+    ///
+    /// A landing pad is a successor of the call's block for liveness: the
+    /// values it uses are live across the call.
+    ///
+    /// # Errors
+    ///
+    /// [`MirError::NotACall`] if `inst` is not a call,
+    /// [`MirError::UnknownSlot`] or [`MirError::UnknownBlock`] for a slot or
+    /// block the function does not have, [`MirError::Limit`] past 32-bit
+    /// tables.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::mir::{Function, MirError, SlotKind};
+    /// use backend_lang::x86_64::{op, SYSV};
+    ///
+    /// let mut f = Function::new("f", &SYSV);
+    /// let b = f.block()?;
+    /// let root = f.stack_slot(SlotKind::Local { size: 8, align: 8 })?;
+    /// let g = f.symbol("g")?;
+    /// let call = f.push(b, op::CALL, &[g.into()])?;
+    /// let ret = f.push(b, op::RET, &[])?;
+    /// f.set_call_site(call, &[root], None)?;
+    /// assert_eq!(f.set_call_site(ret, &[], None), Err(MirError::NotACall { inst: ret }));
+    /// # Ok::<(), MirError>(())
+    /// ```
+    pub fn set_call_site(
+        &mut self,
+        inst: Inst,
+        gc_slots: &[StackSlot],
+        landing_pad: Option<Block>,
+    ) -> Result<(), MirError> {
+        let is_call = self
+            .opcode(inst)
+            .and_then(|o| self.target().inst(o))
+            .is_some_and(|d| d.kind() == InstKind::Call);
+        if !is_call {
+            return Err(MirError::NotACall { inst });
+        }
+        for &s in gc_slots {
+            self.check_slot(s)?;
+        }
+        if let Some(b) = landing_pad {
+            if b.index() >= self.blocks.len() {
+                return Err(MirError::UnknownBlock(b));
+            }
+        }
+        let gc = next_id(self.site_slots.len())?;
+        room(self.site_slots.len().saturating_add(gc_slots.len()))?;
+        let ngc = u32::try_from(gc_slots.len()).map_err(|_| MirError::Limit)?;
+        self.site_slots.extend_from_slice(gc_slots);
+        let data = SiteData {
+            inst,
+            gc,
+            ngc,
+            landing: landing_pad,
+        };
+        // Records arrive in instruction order from instruction selection, so
+        // this is an append; out-of-order records still land sorted.
+        match self.sites.binary_search_by_key(&inst, |s| s.inst) {
+            Ok(i) => self.sites[i] = data,
+            Err(i) => {
+                room(self.sites.len())?;
+                self.sites.insert(i, data);
+            }
+        }
+        Ok(())
+    }
+
+    /// The call-site record of `inst`, if it has one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::mir::{Function, Inst};
+    /// use backend_lang::x86_64::SYSV;
+    ///
+    /// assert!(Function::new("f", &SYSV).call_site(Inst::new(0)).is_none());
+    /// ```
+    #[must_use]
+    pub fn call_site(&self, inst: Inst) -> Option<CallSite<'_>> {
+        let i = self.sites.binary_search_by_key(&inst, |s| s.inst).ok()?;
+        self.sites.get(i).map(|d| self.site_ref(d))
+    }
+
+    /// Every call-site record, by instruction.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::mir::Function;
+    /// use backend_lang::x86_64::SYSV;
+    ///
+    /// assert_eq!(Function::new("f", &SYSV).call_sites().count(), 0);
+    /// ```
+    pub fn call_sites(&self) -> impl ExactSizeIterator<Item = CallSite<'_>> + '_ {
+        self.sites.iter().map(|d| self.site_ref(d))
+    }
+
+    fn site_ref(&self, d: &SiteData) -> CallSite<'_> {
+        let start = d.gc as usize;
+        CallSite {
+            inst: d.inst,
+            gc_slots: self
+                .site_slots
+                .get(start..start + d.ngc as usize)
+                .unwrap_or(&[]),
+            landing_pad: d.landing,
+        }
     }
 
     /// Reserves `bytes` of outgoing argument area at the bottom of the frame

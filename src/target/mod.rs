@@ -368,10 +368,19 @@ pub enum InstKind {
     Call,
     /// An instruction that never falls through and never returns (`ud2`).
     Trap,
+    /// A tail call: the epilogue runs, then control jumps to the callee,
+    /// which returns to this function's caller.
+    TailCall,
+    /// A multi-way branch through a table: a temporary definition, an index
+    /// register, then one target block per index (`jmptbl`). The targets
+    /// take no arguments. The temporary is written before the index is last
+    /// read, so the register allocator never gives the two one register.
+    Switch,
 }
 
 impl InstKind {
-    /// Whether the instruction ends a block: jumps, branches, returns, traps.
+    /// Whether the instruction ends a block: jumps, branches, returns, traps,
+    /// tail calls, and table branches.
     ///
     /// # Examples
     ///
@@ -386,7 +395,12 @@ impl InstKind {
     pub const fn is_terminator(self) -> bool {
         matches!(
             self,
-            InstKind::Jump | InstKind::Branch | InstKind::Return | InstKind::Trap
+            InstKind::Jump
+                | InstKind::Branch
+                | InstKind::Return
+                | InstKind::Trap
+                | InstKind::TailCall
+                | InstKind::Switch
         )
     }
 }
