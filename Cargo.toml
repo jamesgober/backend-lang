@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "backend-lang"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Machine-code backend core: machine IR, target descriptions, instruction selection, and SSA register allocation."
+description = "Machine-code backend core: machine IR, target descriptions, ABI and frame layout, parallel moves, and emission through isa-lang."
 
 # Keywords (5 max)
 keywords = ["backend", "codegen", "register-allocation", "compiler", "lexersketch"]
@@ -45,13 +45,15 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
+std = ["isa-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# The x86-64 encoder and assembler: MIR is lowered to isa-lang instructions,
+# which own every byte of the encoding (first-party, from crates.io).
+isa-lang = { version = "0.2", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -59,6 +61,8 @@ std = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
+# Test-only: wraps emitted code into a static ELF executable for the end-to-end run.
+object-lang = "0.2"
 
 
 # BENCHMARKS

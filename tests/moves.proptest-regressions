@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 213ba668dc665bf968715e6bca6a63c8a9da6174071f67e8f1ae410ca74b2818 # shrinks to moves = [Move { dst: Slot(ss3), src: Imm(165), class: class0 }, Move { dst: Slot(ss1), src: Loc(Reg(p0)), class: class0 }, Move { dst: Reg(p2), src: Loc(Reg(p2)), class: class0 }, Move { dst: Slot(ss0), src: Loc(Reg(p3)), class: class0 }, Move { dst: Reg(p6), src: Loc(Slot(ss1)), class: class0 }, Move { dst: Slot(ss4), src: Imm(191), class: class0 }, Move { dst: Slot(ss2), src: Imm(-471), class: class0 }, Move { dst: Reg(p3), src: Loc(Reg(p6)), class: class0 }, Move { dst: Reg(p1), src: Imm(-249), class: class0 }, Move { dst: Reg(p0), src: Loc(Slot(ss0)), class: class0 }, Move { dst: Reg(p7), src: Imm(297), class: class0 }, Move { dst: Slot(ss5), src: Imm(-338), class: class0 }], free = {p2}, swap = false

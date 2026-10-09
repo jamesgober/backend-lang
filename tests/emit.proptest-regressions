@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 72aec493ad03cf89e6cf0f8f4eb2b6348bb1c89a77e2a1786c87f0ba3dd05b1a # shrinks to edge = ([Reg(p0), Reg(p1), Reg(p2), Reg(p3), Reg(p6), Reg(p8), Reg(p9), Reg(p7), Reg(p12)], [None, None, None, None, None, Some(Reg(p12)), None, None, Some(Reg(p8))], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), win = false
+cc d005c89c171bb1238910f5e81fe75f2608cbbf62a88029cd0cf0db90bb681a04 # shrinks to a = ([], [], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), b = ([Reg(p6), Reg(p1), Reg(p2), Reg(p7), Reg(p8), Reg(p10)], [Some(Reg(p10)), None, None, None, None, Some(Reg(p6))], [0, 0, 0, 0, 0, 0, 0, -498484487158378154, 7685783131521153127, -5083742650188229550, -1454705794898850143, -2523574225614941229, -7690117248286777445, -2750512944576052161, 5440806181945770440, 8771089990445349221, -4877029657271946434, -6309669475121976009]), taken = false, empty = 0
