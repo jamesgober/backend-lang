@@ -21,12 +21,12 @@
         <strong>backend-lang</strong> is the LexerSketch native backend: it takes an <a href="https://crates.io/crates/ir-lang"><code>ir-lang</code></a> 2.0 module through instruction selection, SSA register allocation with exact stack maps, and emission to x86-64 machine code through <a href="https://crates.io/crates/isa-lang"><code>isa-lang</code></a>, producing code, symbols, call-site records, data, and the relocations a linker needs. Underneath sit a machine IR over virtual and physical registers, target descriptions that state everything the backend needs to know about an ISA as data, SysV and Win64 calling conventions and frame layout, and a parallel-move resolver. It replaces rented backends (Cranelift, LLVM) in the LexerSketch toolchain; nothing on its path is a system assembler, linker, or C library.
     </p>
     <p>
-        This release compiles the <strong>integer, control-flow, memory, call, and checked-arithmetic</strong> subset of ir-lang: every OPS integer operation under every policy ir-lang carries (with <code>check</code> error edges), comparisons, conversions, loads and stores, stack slots, field and element addressing, globals, block memory operations, calls and tail calls under SysV and Win64, switches as jump tables or compare trees, GC safepoints with stack maps, and <code>invoke</code> with landing pads (no unwind tables yet). Floating point waits on isa-lang's SSE forms, AArch64 on its AArch64 forms; anything not selected is refused with an error naming what it waits on (see the <a href="./dev/ROADMAP.md">roadmap</a>). Compiled code is checked against ir-lang's reference interpreter on random programs, in an x86-64 interpreter on every platform and natively on x86-64 Linux and Windows.
+        This release compiles the <strong>integer, control-flow, memory, call, and checked-arithmetic</strong> subset of ir-lang 2.0.0-alpha.3, <strong>OPS v2 included</strong>: every OPS integer operation under every policy ir-lang carries (with <code>check</code> error edges), integer <code>pow</code> and <code>shift = saturate</code>, float <code>pow</code> (a call to the runtime's <code>ls_pow</code>, bit-identical to every other tier), comparisons, conversions, loads and stores, stack slots, field and element addressing, globals, block memory operations, calls and tail calls under SysV and Win64, switches as jump tables or compare trees, GC safepoints with stack maps (hand-written or inserted by ir-lang's <code>insert_statepoints</code>), and <code>invoke</code> with landing pads (no unwind tables yet). Floats move as bit patterns in general-purpose registers; float arithmetic other than <code>pow</code> waits on isa-lang's SSE forms, AArch64 on its AArch64 forms; anything not selected is refused with an error naming what it waits on (see the <a href="./dev/ROADMAP.md">roadmap</a>). Compiled code is checked against ir-lang's reference interpreter on random programs, in an x86-64 interpreter on every platform and natively on x86-64 Linux and Windows.
     </p>
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, two dependencies, both from the family: <a href="https://crates.io/crates/isa-lang"><code>isa-lang</code></a> 0.2 and <a href="https://crates.io/crates/ir-lang"><code>ir-lang</code></a> <code>=2.0.0-alpha.1</code> (pinned exactly while it is a pre-release).
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, two dependencies, both from the family: <a href="https://crates.io/crates/isa-lang"><code>isa-lang</code></a> 0.2 and <a href="https://crates.io/crates/ir-lang"><code>ir-lang</code></a> <code>=2.0.0-alpha.3</code> (pinned exactly while it is a pre-release; modules must be built with that version, re-exported as <code>backend_lang::ir_lang</code>).
     </p>
     <blockquote>
         <strong>Status: pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, after jit-lang 2.0 and aot-lang 2.0 run on it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
@@ -53,7 +53,10 @@ What it guarantees, and how each guarantee is checked:
 | Guarantee | How it is held |
 |---|---|
 | Compiled code computes exactly what the IR specifies, results and trap codes alike. | Random valid ir-lang programs (every integer op under every policy, `check` error edges, loops whose back edges permute their parameters, dense and sparse switches, slots and globals through field and element addresses, block memory operations, direct, indirect, and tail calls, high register pressure) are compiled and run against ir-lang's reference interpreter: in the x86-64 test interpreter under SysV and Win64 on every platform, and natively in-process on x86-64 Linux and Windows. Arguments arrive with junk above their width; callee-saved registers and the stack pointer are checked after every return. |
-| Every OPS integer operation, on every type, under every policy. | Each op × type × policy on the OPS edge values (`0, 1, -1, MIN, MAX, MIN+1, MAX-1`, shift amounts around the width) compiled and compared with the interpreter. |
+| Every OPS integer operation, on every type, under every policy, OPS v2 included. | Each op × type × policy on the OPS edge values (`0, 1, -1, MIN, MAX, MIN+1, MAX-1`, shift amounts around the width) compiled and compared with the interpreter, in the test interpreter under both conventions and natively; `pow` (`wrap`, `trap`, `error`) and saturating shifts also with every edge value as a constant operand (the unrolled and folded paths), and a negative `pow` exponent reaching the `check`'s error edge with code 6 under every policy. |
+| Float `pow` is ir-lang's `ls_pow`, bit for bit. | `f64` and `f32` `pow` over signed zeros, infinities, NaNs (payloads included), subnormals, odd and even integers, and random magnitudes, with run-time and constant exponents, compared bit for bit with `ls_pow` and the interpreter, in the test interpreter and natively. |
+| SSA from ir-lang's builders compiles as written. | Random programs built through the variables API (loop headers sealed after their back edges, joins, unassigned reads, `check`ed OPS v2 operations whose error edges assign variables, calls) run against the interpreter; programs whose GC lists `insert_statepoints` added run under the moving collector (and natively), and `invoke`s with inserted statepoints run through the minimal unwinder. |
+| Hostile and huge inputs never panic; the budgets hold. | Any OPS v2 operation with any constant or run-time operands compiles and terminates; a 300,000-instruction function, 20,000 nested branches, a 2,000-parameter join, and 10,000 `pow` loops compile; the live-set budget is exact to the entry and spill rounds never count against it; hostile MIR is rejected with the same error `verify_ssa` gives. |
 | The register assignment is interference-free. | On every function selected from random programs and on hand-built ones with cycles, ties, and fixed registers, an independent liveness checks point by point: no two live values share a register, no value is live across an instruction that writes its register, block parameters avoid each other and every live-in value. |
 | Stack maps are exact. | Every safepoint's recorded root slots are exactly its GC list. A moving collector in the tests walks the real machine stack by the call-site records and frame layouts, moves every object a stack map names, and poisons the old copies, so a missed root or a missed reload changes the result. |
 | Parallel copies are exact: any permutation, cycles of every length, fan-out, registers and stack slots mixed, immediates. | Property tests run the resolver against a parallel-assignment reference over random copies built from explicit cycles, chains, fan-out, and immediates; every step is checked to be one x86-64 can execute; every location that is not a destination is checked unchanged. Cycles of every length from 2 to 14 registers and to 64 slots; a 100,000-slot permutation. |
@@ -71,14 +74,14 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-backend-lang = "0.3"
+backend-lang = "0.4"
 ```
 
 Without the standard library:
 
 ```toml
 [dependencies]
-backend-lang = { version = "0.3", default-features = false }
+backend-lang = { version = "0.4", default-features = false }
 ```
 
 <hr>
@@ -235,6 +238,7 @@ Runnable programs in [`examples/`](./examples):
 |---|---|
 | [`compile`](./examples/compile.rs) | The Tier-1 path: a module with a loop, a checked division whose error edge returns a sentinel, and a caller, compiled for SysV; each function's allocated MIR and disassembly. `cargo run --example compile` |
 | [`emit`](./examples/emit.rs) | Build a loop in MIR, print it, emit it, and disassemble the result. `cargo run --example emit` |
+| [`ops_v2`](./examples/ops_v2.rs) | OPS v2: a `check`ed signed `pow` (code 6 for a negative exponent), a saturating shift, and a float `pow` that imports the runtime's `ls_pow`; the disassembly of each. `cargo run --example ops_v2` |
 | [`moves`](./examples/moves.rs) | The parallel-move resolver on a copy mixing a register rotation, fan-out to a slot, a slot swap, and an immediate, with and without a free register. `cargo run --example moves` |
 
 <hr>
@@ -242,23 +246,26 @@ Runnable programs in [`examples/`](./examples):
 
 ## Performance
 
-Library-only numbers (no process start, no object file), measured with the benchmarks in [`benches/`](./benches) on Windows x86_64, Rust stable, release profile. **The 0.3 numbers were taken while other builds shared the machine**: the unchanged `mir_100k/build` benchmark ran about 2.9× slower than its 0.2 measurement in the same session, so treat the table as an upper bound.
+Library-only numbers (no process start, no object file) on Windows x86_64, Rust stable, release profile. **The machine was shared with other builds during every measurement**, so the 0.4 numbers come in pairs: 0.4 and 0.3 run alternately in the same session (the ignored timing tests, ten runs each, three compiles per run), reported as the median and the best run. Criterion figures for the rest are from one `cargo bench` run in the same session.
 
-| Benchmark | What it measures | 0.2 | 0.3 (loaded machine) |
-|---|---|---:|---:|
-| `mir_100k/build` | Build a 100,000-instruction function (2,000 blocks, each ending in a branch with two four-value edges). | ~4.3 ms | ~12.6 ms |
-| `mir_100k/verify` | Verify it. | ~1.3 ms | ~2.0 ms |
-| `mir_100k/emit` | All of `emit`: verify, lay out the frame, resolve every edge, encode, relax branches. | ~10.5 ms | ~12.4 ms |
-| `moves/permutation/4` | A random permutation of four registers. | ~150 ns | ~152 ns |
-| `moves/edges_100k_x4` | 100,000 four-move edges through one reused resolver. | ~17 ms | ~22 ms |
-| `compile_100k/compile` | `compile` on a 100,000-instruction ir-lang function (loops, branches, calls, memory; spills): validation, selection, allocation, emission. | — | ~175 ms (~0.57 M IR instructions/s) |
-| `compile_100k/isel`, `/regalloc`, `/emit` | Each phase alone on the same function. | — | ~36 / ~174 / ~39 ms (measured separately; that the parts exceed the whole is the noise) |
-| `compile_pressure/compile` | A generated 20,000-statement function under heavy register pressure. | — | ~512 ms |
-| `quality/native` vs `quality/interp` | Compiled code against ir-lang's interpreter: recursive `fib(25)`, a 1,000,000-iteration loop, a 1 KiB memory kernel ×20. | — | 0.38 ms vs 73 ms; 0.53 ms vs 154 ms; 28 µs vs 4.2 ms |
+| Measurement | 0.3 (same session) | 0.4 |
+|---|---:|---:|
+| `compile` of the 100,000-instruction function (validate, select, allocate, emit), median | ~104.5 ms (~0.96 M IR instructions/s) | **~76.2 ms (~1.31 M IR instructions/s)** |
+| The same, best run | ~85.7 ms (~1.17 M/s) | ~65.9 ms (~1.52 M/s) |
+| Register allocation alone on it, median / best | ~70.7 / ~56.3 ms | ~45.1 / ~35.8 ms |
+| Selection / emission alone, median | ~14.8 / ~18.4 ms | ~14.7 / ~19.1 ms (unchanged code) |
+| The high-pressure function (45,833 IR instructions, 4,096 values spilled): select + allocate + emit, median / best | ~184.5 / ~154.7 ms (~0.30 M/s best) | ~129.8 / ~103.1 ms (~0.44 M/s best) |
 
-On the same machine with less load, the ignored timing test (`cargo test --release --test differential timing_realistic -- --ignored --nocapture`) measured the whole pipeline at 0.88–0.99 M IR instructions/s on the 100,000-instruction function. The 1 M/s target is therefore not demonstrated; the allocator, which reruns liveness and coloring once per spill round, is most of the time.
+The **1 M IR instructions/s target is met** on the realistic benchmark (`compile_100k`) by the median and by 23 of 30 compiles in that loaded session (0.3: 11 of 30; the slowest 0.4 run took ~147 ms), and **not** on the high-pressure one (`compile_pressure`), whose allocation cost is its live sets (dozens of values live through thousands of blocks) and whose selection and emission alone take about 36 ms; live-range splitting with interval liveness is v0.5.0 work (ROADMAP).
 
-Everything is linear except one sort when the resolver numbers a copy's locations (`O(n log n)`); a reused resolver allocates nothing once it has seen its largest copy.
+| Criterion benchmark (`cargo bench --bench bench`) | What it measures | 0.4 |
+|---|---|---:|
+| `mir_100k/build`, `/verify`, `/emit`, `/print` | A 100,000-instruction MIR function: build it, verify it, emit it (frame, every edge's parallel copy, encoding, relaxation), print it. | ~5.3 / ~1.9 / ~11.8 / ~7.5 ms |
+| `moves/permutation/4`, `/100000` | Random permutations through the resolver. | ~145 ns / ~12.6 ms |
+| `moves/edges_100k_x4` | 100,000 four-move edges through one reused resolver. | ~17.5 ms |
+| `quality/native` vs `quality/interp` | Compiled code against ir-lang's interpreter: recursive `fib(25)`, a 1,000,000-iteration loop, a 1 KiB memory kernel ×20. | 0.29 ms vs 49 ms; 0.30 ms vs 84 ms; 9.6 µs vs 2.4 ms |
+
+Everything is linear except one sort when the resolver numbers a copy's locations (`O(n log n)`) and liveness, whose cost is the size of the live sets (budgeted, computed once per function); a reused resolver allocates nothing once it has seen its largest copy.
 
 ```bash
 cargo bench --bench bench
@@ -272,6 +279,8 @@ cargo bench --bench bench
 - **Narrow integers stay narrow only where it matters.** An `i8`/`i16`/`i32` value lives in the low bits of a 64-bit register with the upper bits unspecified, exactly as x86-64's 32-bit instructions leave them; wherever the upper bits matter (comparisons, division, right shifts, overflow checks, widening, switch values, array indices, call boundaries) it is extended first by its signedness. `bool` is always exactly 0 or 1.
 - **Division never faults.** Zero and `MIN / -1` are tested before `idiv` runs, so every OPS policy (wrap, trap, error edge) is honoured instead of a processor exception.
 - **Coloring without an interference graph.** In strict SSA, interfering values have one definition dominating the other, so giving each value, in dominance order, a register no live value holds is a correct coloring. Spilling is spill-everywhere with rematerialization; constants and addresses are recomputed instead of stored.
+- **Liveness once, updated per spill round.** Spill code reads and writes no physical register, a spilled value leaves every live-in set, and a reload temporary lives only just before its user, so a round's effect on liveness is known exactly: the allocator updates the analysis instead of recomputing it, and a round costs one coloring walk.
+- **Floats as bit patterns, `pow` from the runtime.** Until isa-lang encodes SSE, a float lives in a general-purpose register as its bits; moving it needs nothing more. Float `pow` is a call to the runtime's `ls_pow` (ir-lang's routine, never a platform libm): compiling `ls_pow` here would mean emulating its IEEE double arithmetic in integer code, thousands of instructions per call, to be thrown away when SSE arrives, and the call is bit-identical by construction.
 - **Stack maps fall out of the IR.** ir-lang's statepoints list every reference live across a safepoint (IR.md §9), so the backend stores exactly those into root slots before the call and reloads the relocated values after it. No reference is ever in a register while a collector runs, and no backend liveness analysis of references is needed.
 - **Block parameters, not phi nodes.** The same information as phis, kept on the edge where it is used: each edge's parallel copy is written down on that edge. ir-lang already uses block parameters, an SSA register allocator resolves each edge with the same resolver, and there is no phi list to keep in sync with predecessor order.
 - **Implicit operands are data.** isa-lang 0.2 describes each form's explicit operands only. A register allocator needs every register an instruction touches, so this crate's instruction table records implicit uses, definitions, and clobbers per row, and calls and returns carry their ABI registers per instruction. The flags are a physical register: producers define it, consumers use it, and an instruction that may leave some flags unchanged (`inc`, a shift by zero) also uses it, so a flag value never appears to come from an instruction that might not have produced it.
@@ -291,7 +300,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo bench --bench bench
 ```
 
-The integration tests carry a small x86-64 interpreter ([`tests/common`](./tests/common/mod.rs)) that executes the bytes the emitter produces, written against isa-lang's decoder alone, so emitted programs and edges are checked on every platform, and a random generator of valid ir-lang programs ([`tests/common/irgen.rs`](./tests/common/irgen.rs)) whose compiled code is compared with ir-lang's reference interpreter ([`tests/differential.rs`](./tests/differential.rs)); on x86-64 Linux and Windows the same programs also run natively in-process ([`tests/native.rs`](./tests/native.rs)), and on Linux [`tests/executable.rs`](./tests/executable.rs) and [`tests/link.rs`](./tests/link.rs) run static executables as real processes. `BACKEND_DIFF_CASES=n` sets the number of programs per differential sweep. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
+The integration tests carry a small x86-64 interpreter ([`tests/common`](./tests/common/mod.rs)) that executes the bytes the emitter produces, written against isa-lang's decoder alone, so emitted programs and edges are checked on every platform, and a random generator of valid ir-lang programs ([`tests/common/irgen.rs`](./tests/common/irgen.rs)) whose compiled code is compared with ir-lang's reference interpreter ([`tests/differential.rs`](./tests/differential.rs)); on x86-64 Linux and Windows the same programs also run natively in-process ([`tests/native.rs`](./tests/native.rs)), and on Linux [`tests/executable.rs`](./tests/executable.rs) and [`tests/link.rs`](./tests/link.rs) run static executables as real processes. [`tests/variables.rs`](./tests/variables.rs) builds programs through ir-lang's variables API, [`tests/stackmaps.rs`](./tests/stackmaps.rs) runs a moving collector over statepoints (hand-written and inserted by ir-lang), and [`tests/hostile.rs`](./tests/hostile.rs) holds the hostile and huge inputs. `BACKEND_DIFF_CASES=n` sets the number of programs per differential sweep. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
 <br>

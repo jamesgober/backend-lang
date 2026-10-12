@@ -107,6 +107,13 @@ impl Conv {
         }
     }
 
+    pub fn caller_saved(self) -> &'static [usize] {
+        match self {
+            Conv::SysV => &[0, 1, 2, 6, 7, 8, 9, 10, 11],
+            Conv::Win64 => &[0, 1, 2, 8, 9, 10, 11],
+        }
+    }
+
     fn shadow(self) -> u64 {
         match self {
             Conv::SysV => 0,
@@ -246,9 +253,36 @@ impl Host for Hosts<'_> {
             let code = m.regs[self.conv.args()[0]] & 0xFFFF_FFFF;
             return Ok(Some(Stop::Trap(code)));
         }
+        if name == "__lexersketch_pow_f64" || name == "__lexersketch_pow_f32" {
+            // The runtime's float pow: ir-lang's `ls_pow` on the bit
+            // patterns. Every caller-saved register is left holding junk, as
+            // a real callee may leave it.
+            let (x, y) = (m.regs[self.conv.args()[0]], m.regs[self.conv.args()[1]]);
+            let r = if name.ends_with("f64") {
+                pow_f64_bits(x, y)
+            } else {
+                u64::from(pow_f32_bits(x as u32, y as u32)) | 0xDEAD_0000_0000_0000
+            };
+            for &k in self.conv.caller_saved() {
+                m.regs[k] = 0x5A5A_0000_0000_0000 | (k as u64);
+            }
+            m.regs[0] = r;
+            return Ok(None);
+        }
         match self.handlers.get_mut(&name) {
             Some(f) => f(m, self.conv),
             None => Err(format!("call to unbound import `{name}`")),
         }
     }
+}
+
+/// The runtime's `f64` pow on bit patterns: ir-lang's `ls_pow`.
+pub fn pow_f64_bits(x: u64, y: u64) -> u64 {
+    ir_lang::ls_pow(f64::from_bits(x), f64::from_bits(y)).to_bits()
+}
+
+/// The runtime's `f32` pow on bit patterns: `ls_pow` of the widened operands,
+/// rounded once.
+pub fn pow_f32_bits(x: u32, y: u32) -> u32 {
+    (ir_lang::ls_pow(f64::from(f32::from_bits(x)), f64::from(f32::from_bits(y))) as f32).to_bits()
 }

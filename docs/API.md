@@ -1,7 +1,7 @@
 # backend-lang &mdash; API Reference
 
 > Complete reference for every public item in `backend-lang`, with examples.
-> **Status: 0.3 (pre-1.0).** The surface is designed across the 0.x series
+> **Status: 0.4 (pre-1.0).** The surface is designed across the 0.x series
 > and frozen at `1.0.0`. See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
@@ -74,7 +74,7 @@
   - [`EmitError`](#emiterror)
 - [Feature flags](#feature-flags)
 - [Limits](#limits)
-- [What 0.3 does not do](#what-03-does-not-do)
+- [What 0.4 does not do](#what-04-does-not-do)
 
 ## Overview
 
@@ -97,18 +97,20 @@
 
 ```toml
 [dependencies]
-backend-lang = "0.3"
+backend-lang = "0.4"
 ```
 
 For `no_std` targets (the crate needs only `alloc`):
 
 ```toml
 [dependencies]
-backend-lang = { version = "0.3", default-features = false }
+backend-lang = { version = "0.4", default-features = false }
 ```
 
 ir-lang is re-exported as `backend_lang::ir_lang`, so the module type the
-backend reads is always the one it was built against.
+backend reads is always the one it was built against: `=2.0.0-alpha.3`,
+pinned exactly while ir-lang 2.0 is a pre-release. A front end must build its
+modules with that version.
 
 ## Quick start
 
@@ -176,6 +178,14 @@ from outside (parameters, call results, loads) are normalized. At call
 boundaries 8- and 16-bit values are extended to 32 bits, as C compilers
 expect; 32-bit values follow the platform rule (upper half unspecified).
 
+**Floats are bit patterns** in this release (isa-lang 0.2 encodes no SSE):
+an `f64` lives in a general-purpose register as its 64 bits, an `f32` in the
+low 32 bits with the upper bits unspecified. Constants, `bitcast` to and
+from the integer of the same width, loads, stores, `select`, block
+parameters, and edge arguments move them unchanged, and `pow` calls the
+runtime (below). Every other float operation, and float arguments and
+results (the conventions pass them in vector registers), is refused.
+
 ### Policies, errors, and traps
 
 Every integer operation is selected under every policy ir-lang can carry:
@@ -190,8 +200,23 @@ Every integer operation is selected under every policy ir-lang can carry:
 Overflow is read from the flags at 32 and 64 bits and from an exact 32-bit
 result plus a range check at 8 and 16 bits; unsigned multiplication checks
 the high half. Division tests zero and then `MIN / -1` before it divides, so
-the processor never faults. Shifts mask the amount (`mask`) or check it
-(`error`: `0 <= n < width`, a negative signed amount failing too).
+the processor never faults. Shifts mask the amount (`mask`), check it
+(`error`: `0 <= n < width`, a negative signed amount failing too), or
+saturate (`saturate`, OPS v2: an amount at or past the width gives zero, or
+the sign for an arithmetic right shift; a negative amount still fails with
+`ShiftOutOfRange`).
+
+OPS v2 `pow`: on integers, the exact power by repeated squaring (`x ** 0 =
+1`), overflow under the `overflow` policy, and a negative exponent the
+`NegativeExponent` error (code 6) under **every** policy. ir-lang
+2.0.0-alpha.3 therefore accepts a signed `pow` only as the operation of a
+`check` (`BinaryOp::can_error(policy, ty)`), and the backend sends a negative
+exponent to that error edge even under `overflow = trap`, which still traps
+(code 1) on an unrepresentable power. A constant exponent is unrolled (at
+most 64 squarings and 64 multiplications); a run-time one loops over its
+bits (at most 64 iterations). On floats, `pow` calls the runtime's routine
+([`Options::pow_f64_symbol`](#options), `pow_f32_symbol`), which must be
+ir-lang's `ls_pow`: the result is then bit-identical to every other tier.
 
 ### Calls, safepoints, and stack maps
 
@@ -207,13 +232,16 @@ root slot before the call and reloaded after it as the relocated value, so
 no reference is in a register while a collector runs. The call's
 [`CallSiteRecord`](#emittedfunction) lists the root slots as offsets from
 `rsp` at the call, keyed by the return address; a collector reads and
-rewrites the references there.
+rewrites the references there. Lists written by hand and lists that
+ir-lang's `Builder::insert_statepoints` adds (with the block parameters it
+places where relocated versions meet, and `resN` on both edges of an
+`invoke`) are the same form and compile the same way.
 
 **`invoke`** records its landing pad on the call site. The unwinder enters
 the pad's stub with the frame as it was at the call (callee-saved registers
 restored) and the exception payload in `rax`; the stub reloads the relocated
 references and jumps to the IR landing pad. This release produces no unwind
-tables (see [What 0.3 does not do](#what-03-does-not-do)).
+tables (see [What 0.4 does not do](#what-04-does-not-do)).
 
 ### Machine IR
 
@@ -329,14 +357,32 @@ builders:
 | `trap_symbol` | `"__lexersketch_trap"` | Called by `trap` and trapping policies with the OPS code; never returns. |
 | `gc_poll_symbol` | `"__lexersketch_gc_poll"` | Called by `safepoint`; a safepoint with a stack map. |
 | `resume_symbol` | `"__lexersketch_resume"` | Called by `resume` with the payload; never returns. |
+| `pow_f64_symbol` | `"__lexersketch_pow_f64"` | Called by an `f64` `pow` under the C convention with the operands' bits as two `u64` integer arguments; returns the result's bits as a `u64`. Must compute `ir_lang::ls_pow`. Not a safepoint. |
+| `pow_f32_symbol` | `"__lexersketch_pow_f32"` | The same for `f32` with `u32` bit patterns: `ls_pow` of the widened operands, rounded once to `f32`. |
 | `jump_table_min_cases` | `4` | The fewest cases a switch needs for a jump table. |
 | `jump_table_max_spread` | `3` | A table is used when the case range is at most this many entries per case (and at most 65,536 entries). |
 | `regalloc: regalloc::Options` | default | Allocation settings. |
 
 Constructors: `sysv()`, `win64()`, `host()`, `with_abi(&Abi)`; builders
 `with_frame_pointer`, `with_runtime(trap, gc_poll, resume)`,
-`with_jump_tables(min_cases, max_spread)`, `with_regalloc`. `Default` is
-`host()`.
+`with_pow_runtime(f64_pow, f32_pow)`, `with_jump_tables(min_cases,
+max_spread)`, `with_regalloc`. `Default` is `host()`.
+
+A runtime provides the two `pow` routines in Rust as:
+
+```rust
+extern "C" fn pow_f64(x: u64, y: u64) -> u64 {
+    ir_lang::ls_pow(f64::from_bits(x), f64::from_bits(y)).to_bits()
+}
+extern "C" fn pow_f32(x: u32, y: u32) -> u32 {
+    let (x, y) = (f64::from(f32::from_bits(x)), f64::from(f32::from_bits(y)));
+    (ir_lang::ls_pow(x, y) as f32).to_bits()
+}
+assert_eq!(pow_f64(2f64.to_bits(), 10f64.to_bits()), 1024f64.to_bits());
+assert_eq!(pow_f32(4f32.to_bits(), 0.5f32.to_bits()), 2f32.to_bits());
+let o = backend_lang::Options::sysv().with_pow_runtime("rt_pow", "rt_powf");
+assert_eq!(o.pow_f32_symbol, "rt_powf");
+```
 
 ```rust
 use backend_lang::Options;
@@ -457,14 +503,16 @@ What is selected:
 | `add sub mul` | `add`/`sub`/`imul` at 32 or 64 bits; overflow from OF/CF, from an exact 32-bit result at 8/16 bits, or from the high half for unsigned multiplication. Commutative operands are ordered so that an operand used only here is the one overwritten (a constant goes right, as an immediate). |
 | `div rem floor_div floor_mod` | Zero and `MIN / -1` tested first; `div`/`idiv` through `rdx:rax`; floor variants fixed up with `cmov`. |
 | `and or xor not neg abs min max` | ALU ops, `neg` + `cmov` for `abs`, `cmp` + `cmov` for `min`/`max`. |
-| `shl shr` | By immediate when constant and in range, else by `cl`, masked or range-checked. |
+| `shl shr` | By immediate when constant and in range, else by `cl`, masked, range-checked, or saturated (`cmov` to zero, or the count clamped to `width - 1` for an arithmetic right shift; a signed amount tested for sign first). A constant amount past the width under `saturate` folds. |
+| `pow` (integer) | Repeated squaring: unrolled for a constant exponent, a four-block loop over the exponent's bits otherwise; `imul` at 64 bits, every product checked under `trap`/`error` (`mul`'s overflow for `u64`; 8/16/32-bit types exact in 64 bits, range-checked at the end); a signed exponent tested for sign first (error code 6). |
+| `pow` (float), float constants, `bitcast`, float loads/stores/`select`/edges | A call to the runtime's `ls_pow` routine with the bit patterns in integer registers; everything else moves the bits. |
 | `eq ne lt le gt ge`, `select` | `cmp` fused into the branch or `cmov` that uses it once in the same block, else `setcc`. |
 | Conversions | `int_cast` (checked by re-extension), `zext`, `sext`, `narrow`, `bitcast`, `bool_to_int`, `ptr_to_int`, `int_to_ptr`, `ref_to_ptr` (free), `char_from_u32` (two compares). |
 | `load`, `store`, atomics | `mov`/`movzx`/`movsx` at every width; constant offsets folded into the memory operand; `atomic_load`/`atomic_store` as plain moves (TSO), `seq_cst` stores and `atomic_rmw xchg` as `xchg`, `fence seq_cst` as a locked `xchg` on a private slot. |
 | Addresses | `stack_addr` (rounded up at run time for alignment above 16), `global_addr`/`func_addr` (RIP-relative `lea`), `field_addr`, `elem_addr` (scaled `lea` or `imul`), `ptr_offset`. |
 | `memcpy memmove memset` | Eight-byte loops then byte loops; `memmove` picks the direction by address order. |
 | `call`, `call_indirect`, `tail_call`, `safepoint` | As in [Calls, safepoints, and stack maps](#calls-safepoints-and-stack-maps); an indirect tail call goes through `r11`. |
-| `jump br switch ret unreachable trap` | `jmp`, `jcc`; `switch` as a bounds-checked jump table when dense ([`Options`](#options)), else a balanced compare tree; `ret` through the return registers; `ud2`; a call to the trap handler. |
+| `jump br switch ret unreachable trap` | `jmp`, `jcc`; `switch` as a bounds-checked jump table when dense ([`Options`](#options)), else a balanced compare tree; `ret` through the return registers; `ud2` (also when a `check`'s error edge an optimizer proved dead goes to a shared `unreachable` block); a call to the trap handler. |
 | `check`, `invoke`, `resume` | The operation with its failure branching to the error edge; a call with a landing pad; a call to `resume_symbol`. |
 
 `IselError` (`#[non_exhaustive]`, `Clone`, `PartialEq`, `Display`,
@@ -477,8 +525,10 @@ What is selected:
 | `Unsupported { func, what }` | A construct this release does not select; `what` names what it waits on. |
 | `Mir(MirError)` | Building the MIR failed (a 32-bit table limit). |
 
-Refused today, each as `Unsupported`: floating-point types and operations
-(isa-lang SSE, ISSUES P11); `atomic_rmw` other than `xchg`, and `cmpxchg`
+Refused today, each as `Unsupported`: float arithmetic other than `pow`,
+float comparisons, conversions between floats and integers, and float
+arguments and results (isa-lang SSE, ISSUES P11); `atomic_rmw` other than
+`xchg`, and `cmpxchg`
 (`lock`-prefixed forms); the `aapcs64` convention (the AArch64 target);
 32-bit pointer modules; more results than return registers (two under
 SysV, one under Win64); a tail call needing more stack-argument space than
@@ -529,8 +579,18 @@ values in usable registers (uses per instruction spanned) is spilled for its
 whole life: constants and addresses are rematerialized at each use, other
 values stored once after their definition and read from the slot directly
 where the instruction takes a memory operand, else through a reload
-temporary. The allocation then reruns; after [`MAX_ROUNDS`](#regalloc-options)
+temporary. Coloring then reruns; after [`MAX_ROUNDS`](#regalloc-options)
 rounds every remaining long-lived value is spilled, which always succeeds.
+
+**Cost.** Definitions and uses are indexed in one walk (which also checks
+dominance), and liveness is analysed once. A spill round reports what it
+changed, and the live sets, last uses, fixed-register facts, and affinities
+are updated in place: spill code reads and writes no physical register,
+every spilled value leaves every live-in set, and each reload temporary
+lives only from just before its user to the user, so the update is exact.
+A round costs one coloring walk plus work proportional to the live sets and
+the spill code. The live budget applies to the one analysis; rounds only
+shrink the live sets.
 Callee-saved registers are ordinary registers: a value live across a call can
 only sit in one, and the frame saves exactly those written.
 
@@ -581,7 +641,8 @@ locations, for checking an allocation independently). Builders
 
 `Allocation`: `rounds()` (1 when nothing spilled), `spilled()`,
 `rematerialized()`, `max_pressure()` (the most values of one class live at
-once in the final round), and `assignment()` (with `keep_assignment`: the
+once before any spilling: the pressure the function demands; 0.3 reported
+the final round's), and `assignment()` (with `keep_assignment`: the
 final virtual function and each virtual register's `Location`).
 
 `Location` (`#[non_exhaustive]`): `None` (never live), `Reg(PReg)`,
@@ -1506,17 +1567,17 @@ assert_eq!((r.kind, r.symbol.as_str(), r.addend), (RelocKind::Call32, "puts", -4
 | Allocation rounds | `MAX_ROUNDS` + 1 (the last spills every long-lived value) | always allocates, or `NoRegister` |
 | Jump-table entries | 65,536 | a compare tree instead |
 
-## What 0.3 does not do
+## What 0.4 does not do
 
 Recorded with reasons in [`dev/ROADMAP.md`](../dev/ROADMAP.md):
 
-- **Floating point and SIMD**, and the vector half of the conventions: they
-  need isa-lang's SSE forms (ISSUES P11). Refused as
-  `IselError::Unsupported`.
+- **Floating point and SIMD** beyond moving bit patterns and `pow`, and the
+  vector half of the conventions: they need isa-lang's SSE forms (ISSUES
+  P11). Refused as `IselError::Unsupported`.
 - **`atomic_rmw` other than `xchg`, and `cmpxchg`**: they need
   `lock`-prefixed forms isa-lang 0.2 does not encode. Refused.
-- **`shift = saturate`** (OPS v2): ir-lang 2.0.0-alpha.1 cannot express it
-  (its `Shift` has `error` and `mask`), so there is nothing to select yet.
+- **Live-range splitting**: spilling is for a value's whole life. Under
+  heavy register pressure the allocator's cost is its live sets.
 - **Unwind tables**: no Win64 `.pdata`/`.xdata`, DWARF CFI, or LSDA, and no
   personality routine. `invoke` records its landing pad per call site and
   the pads work under an unwinder that restores the frame as the records

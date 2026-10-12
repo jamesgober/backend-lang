@@ -4,7 +4,8 @@
 //! Blocks and block parameters map one to one (IR.md §15): an IR edge's
 //! arguments become the MIR branch's arguments, resolved as a parallel copy
 //! at emission. Every value of an integer, `bool`, `ptr`, or `ref` type lives
-//! in one general-purpose virtual register.
+//! in one general-purpose virtual register, and in this release so does a
+//! float's bit pattern (see below).
 //!
 //! # Value representation
 //!
@@ -26,16 +27,41 @@
 //! ([`Options::trap_symbol`](crate::Options)) with the OPS code; `error`
 //! (only inside a `check` terminator) branches to the error edge, passing
 //! the OPS code as `err`. Division checks zero, then `MIN / -1`, before it
-//! divides, so the processor never faults. Shifts check or mask their
-//! amount.
+//! divides, so the processor never faults. Shifts check, mask, or saturate
+//! their amount (`saturate`, OPS v2: an amount at or past the width shifts
+//! every bit out, leaving the sign for an arithmetic right shift; a negative
+//! amount is still `ShiftOutOfRange`).
+//!
+//! Integer `pow` (OPS v2) is repeated squaring: unrolled when the exponent
+//! is a constant (at most 64 squarings and 64 multiplications), a loop over
+//! the exponent's bits otherwise (at most 64 iterations), each product
+//! checked for overflow under `trap` and `error`. A negative exponent is the
+//! `NegativeExponent` error (code 6) under every policy, which is why
+//! ir-lang 2.0.0-alpha.3 makes every signed `pow` the operation of a `check`
+//! (`BinaryOp::can_error`).
+//!
+//! # Floats as bit patterns
+//!
+//! isa-lang 0.2 encodes no SSE, so this release keeps a float in a
+//! general-purpose register as its bit pattern (`f32` in the low 32 bits,
+//! the upper bits unspecified, like `i32`). Everything that only moves a
+//! value works on floats: constants, `bitcast` to and from the integer of
+//! the same width, loads, stores, `select`, block parameters and edge
+//! arguments. Float `pow` calls the runtime's `ls_pow` routine
+//! ([`Options::pow_f64_symbol`](crate::Options::pow_f64_symbol),
+//! [`Options::pow_f32_symbol`](crate::Options::pow_f32_symbol)) with the bit
+//! patterns in integer registers: ir-lang's own routine, never a platform
+//! libm, so the result is bit-identical to every other tier.
 //!
 //! # What is not selected yet
 //!
-//! Floating-point types and operations wait on isa-lang's SSE forms (ISSUES
-//! P11), as do `lock`-prefixed atomic read-modify-writes other than `xchg`
-//! and `cmpxchg`; `aapcs64` waits on the AArch64 target; 32-bit pointer
-//! modules on a 32-bit target. Each is reported as
-//! [`IselError::Unsupported`], never miscompiled.
+//! Float arithmetic other than `pow`, float comparisons, conversions between
+//! floats and integers, and float arguments and results (both conventions
+//! pass them in vector registers) wait on isa-lang's SSE forms (ISSUES P11),
+//! as do `lock`-prefixed atomic read-modify-writes other than `xchg` and
+//! `cmpxchg`; `aapcs64` waits on the AArch64 target; 32-bit pointer modules
+//! on a 32-bit target. Each is reported as [`IselError::Unsupported`], never
+//! miscompiled.
 
 mod call;
 mod mem;
@@ -312,8 +338,8 @@ impl<'m> Sel<'m> {
             }
             let mb = self.block(b)?;
             for &p in irf.block_params(b) {
-                let ty = self.ty(p)?;
-                let _ = ty;
+                // Any type: a float parameter holds its bit pattern.
+                let _ = self.ty_any(p)?;
                 let v = self.new_reg()?;
                 self.vals[p.index()] = Some(v);
                 self.f.add_param(mb, v.into())?;
@@ -507,16 +533,23 @@ impl<'m> Sel<'m> {
         Ok(self.f.vreg(GPR)?)
     }
 
-    /// The type of an IR value; floats are not selected yet.
+    /// The type of an IR value that an integer operation reads; floats are
+    /// refused (their arithmetic waits on isa-lang's SSE forms).
     pub(crate) fn ty(&self, v: Value) -> Result<Type> {
-        let t = self
-            .irf
-            .value_type(self.irf.resolve(v))
-            .ok_or(IselError::Mir(MirError::Limit))?;
+        let t = self.ty_any(v)?;
         if t.is_float() {
-            return self.unsupported("floating point waits on isa-lang's SSE forms (ISSUES P11)");
+            return self.unsupported(FLOAT_ARITH);
         }
         Ok(t)
+    }
+
+    /// The type of an IR value, floats included: for code that only moves
+    /// a value (edges, `select`, loads, stores, `bitcast`), where a float is
+    /// its bit pattern in a general-purpose register.
+    pub(crate) fn ty_any(&self, v: Value) -> Result<Type> {
+        self.irf
+            .value_type(self.irf.resolve(v))
+            .ok_or(IselError::Mir(MirError::Limit))
     }
 
     /// The register holding IR value `v`.
@@ -748,11 +781,9 @@ impl<'m> Sel<'m> {
         let data = irf.inst(inst).ok_or(MirError::Limit)?.clone();
         let results = irf.results(inst);
         match data {
-            InstData::Const { ty, bits } => {
-                if ty.is_float() {
-                    return self
-                        .unsupported("floating point waits on isa-lang's SSE forms (ISSUES P11)");
-                }
+            InstData::Const { bits, .. } => {
+                // A float constant is its bit pattern (`f32` in the low 32
+                // bits), like any other constant.
                 let r = results.first().ok_or(MirError::Limit)?;
                 let d = self.emit_def(op::MOV64RI, &[Operand::Imm(bits as i64)])?;
                 self.set_val(r, d);
@@ -797,7 +828,7 @@ impl<'m> Sel<'m> {
             }
             InstData::Select { cond, args } => {
                 let r = results.first().ok_or(MirError::Limit)?;
-                let _ = self.ty(r)?;
+                let _ = self.ty_any(r)?;
                 let cc = self.condition(cond)?;
                 let (a, b) = (self.val(args[0])?, self.val(args[1])?);
                 // d = cc ? a : b
@@ -806,9 +837,7 @@ impl<'m> Sel<'m> {
                 self.set_val(r, d);
                 Ok(())
             }
-            InstData::Fma { .. } => self.unsupported(
-                "fma is floating point, which waits on isa-lang's SSE forms (ISSUES P11)",
-            ),
+            InstData::Fma { .. } => self.unsupported(FLOAT_ARITH),
             InstData::Call(call) => self.call(&call, results),
             InstData::Safepoint { gc } => self.safepoint(&gc, results),
             other => self.memory(&other, results),
@@ -832,6 +861,9 @@ impl<'m> Sel<'m> {
         Ok(isa_lang::x86_64::Cond::Ne)
     }
 }
+
+/// Why floating-point arithmetic is refused.
+pub(crate) const FLOAT_ARITH: &str = "floating-point arithmetic waits on isa-lang's SSE forms (ISSUES P11); only pow, bitcast, constants, loads, stores, select, and edges are selected";
 
 /// The first integer argument register of a convention.
 pub(crate) fn first_int_arg(abi: &Abi) -> Result<PReg> {

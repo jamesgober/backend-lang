@@ -12,17 +12,23 @@ use crate::regs::Reg;
 use crate::target::{ImmRange, Opcode};
 use crate::x86_64::{RAX, RCX, RDX, op};
 
-/// Whether a type is computed with 64-bit instructions.
+/// Whether a type is computed (or, for `f64`, moved) with 64-bit
+/// instructions.
 pub(crate) fn is64(ty: Type) -> bool {
-    matches!(ty, Type::I64 | Type::U64 | Type::Ptr | Type::Ref)
+    matches!(
+        ty,
+        Type::I64 | Type::U64 | Type::Ptr | Type::Ref | Type::F64
+    )
 }
 
-/// The width in bits a type's value occupies (`bool` counts as 8).
+/// The width in bits a type's value occupies (`bool` counts as 8). A float
+/// is its bit pattern in a general-purpose register (see the module
+/// documentation of [`isel`](crate::isel)).
 pub(crate) fn bits(ty: Type) -> u32 {
     match ty {
         Type::Bool | Type::I8 | Type::U8 => 8,
         Type::I16 | Type::U16 => 16,
-        Type::I32 | Type::U32 => 32,
+        Type::I32 | Type::U32 | Type::F32 => 32,
         _ => 64,
     }
 }
@@ -230,6 +236,9 @@ impl Sel<'_> {
         args: [Value; 2],
         fail: Fail<'_>,
     ) -> Result<Reg> {
+        if bop == BinaryOp::Pow && self.ty_any(args[0])?.is_float() {
+            return self.float_pow(args);
+        }
         let ty = self.ty(args[0])?;
         match bop {
             BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
@@ -250,6 +259,7 @@ impl Sel<'_> {
                 self.divide(bop, policy, ty, args, fail)
             }
             BinaryOp::Shl | BinaryOp::Shr => self.shift(bop, policy, ty, args, fail),
+            BinaryOp::Pow => self.pow(policy, ty, args, fail),
             BinaryOp::Min | BinaryOp::Max => {
                 let wide = is64(ty);
                 let a = self.val(args[0])?;
@@ -564,6 +574,9 @@ impl Sel<'_> {
             (false, true, false) => (op::SAR32, op::SAR32CL),
             (false, true, true) => (op::SAR64, op::SAR64CL),
         };
+        // An arithmetic right shift saturates to the sign: a shift by `w - 1`
+        // of the value extended to the operation's width.
+        let arith = !left && sign;
         // A constant amount in range shifts by an immediate.
         if let Some(kb) = self.konst(args[1]) {
             let n = if sign {
@@ -574,16 +587,66 @@ impl Sel<'_> {
             if (0..i64::from(w)).contains(&n) {
                 return self.emit_def(op_imm, &[a.into(), Operand::Imm(n)]);
             }
-            if mode == Shift::Mask {
-                let n = (kb & u64::from(w - 1)) as i64;
-                return self.emit_def(op_imm, &[a.into(), Operand::Imm(n)]);
+            match mode {
+                Shift::Mask => {
+                    let n = (kb & u64::from(w - 1)) as i64;
+                    return self.emit_def(op_imm, &[a.into(), Operand::Imm(n)]);
+                }
+                // Every bit shifted out. A negative amount still fails: the
+                // general path below tests it.
+                Shift::Saturate if n >= 0 => {
+                    return if arith {
+                        self.emit_def(op_imm, &[a.into(), Operand::Imm(i64::from(w - 1))])
+                    } else {
+                        self.emit_def(op::MOV64RI, &[Operand::Imm(0)])
+                    };
+                }
+                _ => {}
             }
         }
         let b0 = self.val(args[1])?;
-        let count = match mode {
-            Shift::Mask if w >= 32 => b0, // the processor masks by 31 or 63
+        match mode {
             Shift::Mask => {
-                self.emit_def(op::AND32, &[b0.into(), Operand::Imm(i64::from(w - 1))])?
+                let count = if w >= 32 {
+                    b0 // the processor masks by 31 or 63
+                } else {
+                    self.emit_def(op::AND32, &[b0.into(), Operand::Imm(i64::from(w - 1))])?
+                };
+                let _ = self.emit(op::COPY, &[RCX.into(), count.into()])?;
+                self.emit_def(op_cl, &[a.into()])
+            }
+            Shift::Saturate => {
+                let n = self.ext64(b0, ty, Ext::Type)?;
+                if sign {
+                    // A negative amount is still out of range (OPS v2).
+                    let _ = self.emit(op::TEST64, &[n.into(), n.into()])?;
+                    self.fail_if(Cond::S, fail, OpError::ShiftOutOfRange.code())?;
+                }
+                if arith {
+                    // count = min(n, w - 1), unsigned (n is not negative).
+                    let top = self.emit_def(op::MOV64RI, &[Operand::Imm(i64::from(w - 1))])?;
+                    let _ = self.emit(op::CMP64, &[n.into(), Operand::Imm(i64::from(w - 1))])?;
+                    let count = self.emit_def(
+                        op::CMOV64,
+                        &[n.into(), top.into(), crate::x86_64::cond(Cond::A).into()],
+                    )?;
+                    let _ = self.emit(op::COPY, &[RCX.into(), count.into()])?;
+                    self.emit_def(op_cl, &[a.into()])
+                } else {
+                    // Shifted by the masked amount, then zero when n >= w.
+                    let _ = self.emit(op::COPY, &[RCX.into(), n.into()])?;
+                    let shifted = self.emit_def(op_cl, &[a.into()])?;
+                    let zero = self.emit_def(op::MOV64RI, &[Operand::Imm(0)])?;
+                    let _ = self.emit(op::CMP64, &[n.into(), Operand::Imm(i64::from(w))])?;
+                    self.emit_def(
+                        op::CMOV64,
+                        &[
+                            shifted.into(),
+                            zero.into(),
+                            crate::x86_64::cond(Cond::Ae).into(),
+                        ],
+                    )
+                }
             }
             _ => {
                 // In range: 0 <= n < w, as one unsigned compare of the
@@ -591,11 +654,177 @@ impl Sel<'_> {
                 let n = self.ext64(b0, ty, Ext::Type)?;
                 let _ = self.emit(op::CMP64, &[n.into(), Operand::Imm(i64::from(w))])?;
                 self.fail_if(Cond::Ae, fail, OpError::ShiftOutOfRange.code())?;
-                n
+                let _ = self.emit(op::COPY, &[RCX.into(), n.into()])?;
+                self.emit_def(op_cl, &[a.into()])
+            }
+        }
+    }
+
+    /// Integer `pow` (OPS v2): the exact power by repeated squaring, `x ** 0
+    /// = 1` (`0 ** 0` included), under the `overflow` policy. A negative
+    /// exponent (signed types only) fails with `NegativeExponent` under every
+    /// policy: it goes to `fail` (a `check`'s error edge; ir-lang refuses a
+    /// signed `pow` outside a `check`), never to the overflow trap.
+    ///
+    /// A square is taken only while a higher exponent bit remains, so every
+    /// square computed is a factor of the result, and `|r| >= 1` whenever the
+    /// base is nonzero: if any product overflows, the result does. The checks
+    /// therefore follow every multiplication. 8-, 16-, and 32-bit types
+    /// compute exactly in 64 bits (an overflow there is far outside their
+    /// range) and check the range at the end; `u64` multiplies with `mul`,
+    /// whose overflow flag is unsigned overflow. Wrapping needs only the low
+    /// bits, which a 64-bit multiply gives for every width.
+    fn pow(&mut self, policy: Policy, ty: Type, args: [Value; 2], fail: Fail<'_>) -> Result<Reg> {
+        let w = bits(ty);
+        let sign = signed(ty);
+        let overflow = policy.overflow.unwrap_or(Overflow::Wrap);
+        let checked = overflow != Overflow::Wrap;
+        let over = self.overflow_sink(overflow, fail);
+        let x0 = self.val(args[0])?;
+        // Wrapping needs only the low bits, which do not depend on the bits
+        // above the width; an exact power needs the true operand.
+        let x = if checked && w < 64 {
+            self.ext64(x0, ty, Ext::Type)?
+        } else {
+            x0
+        };
+        let mul = PowMul {
+            checked,
+            wide_unsigned: checked && !sign && w == 64,
+            over,
+        };
+        let e_const = self.konst(args[1]).map(|kb| {
+            if sign {
+                sext_bits(kb, w)
+            } else {
+                zext_bits(kb, w) as i64
+            }
+        });
+        let r = match e_const {
+            // A known exponent unrolls (at most 64 squarings and 64
+            // multiplications). A negative one takes the general path, which
+            // fails on it.
+            Some(e) if e >= 0 || !sign => self.pow_unrolled(x, e as u64, mul)?,
+            _ => {
+                let e0 = self.val(args[1])?;
+                let e = self.ext64(e0, ty, Ext::Type)?;
+                if sign {
+                    let _ = self.emit(op::TEST64, &[e.into(), e.into()])?;
+                    self.fail_if(Cond::S, fail, OpError::NegativeExponent.code())?;
+                }
+                self.pow_loop(x, e, mul)?
             }
         };
-        let _ = self.emit(op::COPY, &[RCX.into(), count.into()])?;
-        self.emit_def(op_cl, &[a.into()])
+        if checked && w < 64 {
+            // The exact power must fit the type: extending its low bits by the
+            // type's signedness gives it back.
+            let t = self.ext64(r, ty, Ext::Type)?;
+            let _ = self.emit(op::CMP64, &[t.into(), r.into()])?;
+            self.fail_if(Cond::Ne, over, OpError::ArithOverflow.code())?;
+        }
+        Ok(r)
+    }
+
+    /// `a * b` for `pow`, checked as `m` says.
+    fn pow_mul(&mut self, a: Reg, b: Reg, m: PowMul<'_>) -> Result<Reg> {
+        if m.wide_unsigned {
+            let _ = self.emit(op::COPY, &[RAX.into(), a.into()])?;
+            let _ = self.emit(op::MUL64, &[b.into()])?;
+            let d = self.copy_to_new(RAX.into())?;
+            self.fail_if(Cond::O, m.over, OpError::ArithOverflow.code())?;
+            return Ok(d);
+        }
+        let d = self.emit_def(op::IMUL64, &[a.into(), b.into()])?;
+        if m.checked {
+            self.fail_if(Cond::O, m.over, OpError::ArithOverflow.code())?;
+        }
+        Ok(d)
+    }
+
+    /// `x ** e` for a known `e`, as straight-line repeated squaring.
+    fn pow_unrolled(&mut self, x: Reg, e: u64, m: PowMul<'_>) -> Result<Reg> {
+        let mut r: Option<Reg> = None;
+        let (mut base, mut n) = (x, e);
+        while n != 0 {
+            if n & 1 == 1 {
+                r = Some(match r {
+                    None => base,
+                    Some(r) => self.pow_mul(r, base, m)?,
+                });
+            }
+            n >>= 1;
+            if n != 0 {
+                base = self.pow_mul(base, base, m)?;
+            }
+        }
+        match r {
+            Some(r) => Ok(r),
+            None => self.emit_def(op::MOV64RI, &[Operand::Imm(1)]),
+        }
+    }
+
+    /// `x ** e` for an exponent known only at run time (`e` not negative,
+    /// read as unsigned): a loop over its bits.
+    ///
+    /// ```text
+    ///                 jmp head(1, x, e)
+    /// head(r, b, n):  test n, 1; je step(r) else mul
+    /// mul:            r2 = r * b [check]; jmp step(r2)
+    /// step(rr):       n2 = n >> 1; test n2, n2; je done(rr) else sq
+    /// sq:             b2 = b * b [check]; jmp head(rr, b2, n2)
+    /// done(res):
+    /// ```
+    fn pow_loop(&mut self, x: Reg, e: Reg, m: PowMul<'_>) -> Result<Reg> {
+        let head = self.new_block()?;
+        let (r, b, n) = (self.new_reg()?, self.new_reg()?, self.new_reg()?);
+        for p in [r, b, n] {
+            self.f.add_param(head, p.into())?;
+        }
+        let mul = self.new_block()?;
+        let step = self.new_block()?;
+        let rr = self.new_reg()?;
+        self.f.add_param(step, rr.into())?;
+        let sq = self.new_block()?;
+        let done = self.new_block()?;
+        let res = self.new_reg()?;
+        self.f.add_param(done, res.into())?;
+
+        let one = self.emit_def(op::MOV64RI, &[Operand::Imm(1)])?;
+        self.jump(head, &[one.into(), x.into(), e.into()])?;
+
+        self.cur = head;
+        let _ = self.emit(op::TEST64, &[n.into(), Operand::Imm(1)])?;
+        let skip = self.f.block_call(step, &[r.into()])?;
+        let take = self.f.block_call(mul, &[])?;
+        let _ = self.emit(
+            op::JCC,
+            &[
+                crate::x86_64::cond(Cond::E).into(),
+                skip.into(),
+                take.into(),
+            ],
+        )?;
+
+        self.cur = mul;
+        let r2 = self.pow_mul(r, b, m)?;
+        self.jump(step, &[r2.into()])?;
+
+        self.cur = step;
+        let n2 = self.emit_def(op::SHR64, &[n.into(), Operand::Imm(1)])?;
+        let _ = self.emit(op::TEST64, &[n2.into(), n2.into()])?;
+        let out = self.f.block_call(done, &[rr.into()])?;
+        let more = self.f.block_call(sq, &[])?;
+        let _ = self.emit(
+            op::JCC,
+            &[crate::x86_64::cond(Cond::E).into(), out.into(), more.into()],
+        )?;
+
+        self.cur = sq;
+        let b2 = self.pow_mul(b, b, m)?;
+        self.jump(head, &[rr.into(), b2.into(), n2.into()])?;
+
+        self.cur = done;
+        Ok(res)
     }
 
     /// Sets the flags for an integer comparison and returns the condition
@@ -645,6 +874,11 @@ impl Sel<'_> {
         arg: Value,
         fail: Fail<'_>,
     ) -> Result<Reg> {
+        // A float lives as its bit pattern, so a `bitcast` to or from one
+        // moves nothing.
+        if cop == ConvOp::Bitcast && (to.is_float() || self.ty_any(arg)?.is_float()) {
+            return self.val(arg);
+        }
         if to.is_float() {
             return self.unsupported(
                 "conversions to floating point wait on isa-lang's SSE forms (ISSUES P11)",
@@ -704,6 +938,15 @@ impl Sel<'_> {
             ),
         }
     }
+}
+
+/// How `pow` multiplies: whether it checks for overflow, whether it needs
+/// the unsigned 64-bit `mul`, and where an overflow goes.
+#[derive(Clone, Copy)]
+struct PowMul<'a> {
+    checked: bool,
+    wide_unsigned: bool,
+    over: Fail<'a>,
 }
 
 /// Keeps `IselError` and `MirError` in this module's signatures readable.

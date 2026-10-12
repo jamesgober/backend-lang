@@ -27,6 +27,15 @@ use crate::x86_64::{self, EmitError, EmittedFunction, Emitter, Program, Reloc, R
 /// | `trap_symbol` | for `trap` and every trapping policy | the OPS code (first argument); never returns |
 /// | `gc_poll_symbol` | for a `safepoint` instruction | nothing; a safepoint with a stack map |
 /// | `resume_symbol` | for `resume` | the exception payload; never returns |
+/// | `pow_f64_symbol` | for an `f64` `pow` | the operands' bit patterns as two `u64` integer arguments; returns the result's bits as a `u64` |
+/// | `pow_f32_symbol` | for an `f32` `pow` | the operands' bit patterns as two `u32` integer arguments; returns the result's bits as a `u32` |
+///
+/// The two `pow` routines must compute ir-lang's `ls_pow` (OPS v2: the same
+/// bits on every tier, never a platform libm); for `f32`, `ls_pow` of both
+/// operands widened to `f64`, rounded once. In Rust, `ir_lang::ls_pow(
+/// f64::from_bits(x), f64::from_bits(y)).to_bits()`. They take bit patterns
+/// in integer registers because this release keeps floats in general-purpose
+/// registers (isa-lang 0.2 encodes no SSE).
 ///
 /// # Examples
 ///
@@ -53,6 +62,10 @@ pub struct Options {
     pub gc_poll_symbol: &'static str,
     /// The runtime's unwinder entry, called by `resume`.
     pub resume_symbol: &'static str,
+    /// The runtime's `ls_pow` for `f64` (bit patterns in, bit pattern out).
+    pub pow_f64_symbol: &'static str,
+    /// The runtime's `ls_pow` for `f32` (bit patterns in, bit pattern out).
+    pub pow_f32_symbol: &'static str,
     /// The fewest cases a switch needs for a jump table.
     pub jump_table_min_cases: u32,
     /// A jump table is used when the case values span at most this many
@@ -130,6 +143,8 @@ impl Options {
             trap_symbol: "__lexersketch_trap",
             gc_poll_symbol: "__lexersketch_gc_poll",
             resume_symbol: "__lexersketch_resume",
+            pow_f64_symbol: "__lexersketch_pow_f64",
+            pow_f32_symbol: "__lexersketch_pow_f32",
             jump_table_min_cases: 4,
             jump_table_max_spread: 3,
             regalloc: regalloc::Options::new(),
@@ -171,6 +186,29 @@ impl Options {
         self.trap_symbol = trap;
         self.gc_poll_symbol = gc_poll;
         self.resume_symbol = resume;
+        self
+    }
+
+    /// Renames the runtime's float `pow` routines (see [`Options`] for their
+    /// contract).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use backend_lang::Options;
+    ///
+    /// let o = Options::sysv().with_pow_runtime("my_pow", "my_powf");
+    /// assert_eq!((o.pow_f64_symbol, o.pow_f32_symbol), ("my_pow", "my_powf"));
+    /// assert_eq!(Options::sysv().pow_f64_symbol, "__lexersketch_pow_f64");
+    /// ```
+    #[must_use]
+    pub const fn with_pow_runtime(
+        mut self,
+        f64_pow: &'static str,
+        f32_pow: &'static str,
+    ) -> Options {
+        self.pow_f64_symbol = f64_pow;
+        self.pow_f32_symbol = f32_pow;
         self
     }
 
@@ -600,6 +638,8 @@ pub fn compile(module: &Module, options: &Options) -> Result<Compiled, CompileEr
         options.trap_symbol,
         options.gc_poll_symbol,
         options.resume_symbol,
+        options.pow_f64_symbol,
+        options.pow_f32_symbol,
     ] {
         if !defined.contains(rt) {
             let _ = externals.insert(rt.to_string());

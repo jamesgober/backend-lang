@@ -128,6 +128,12 @@ impl Native {
     /// Loads `c`: [code | stubs and thunk] (made executable) then [data |
     /// cells] (read-write). Calls through the thunk use `conv`.
     pub fn load(c: &Compiled, conv: Conv) -> Result<Native, String> {
+        Native::load_with(c, conv, &[])
+    }
+
+    /// [`Native::load`], binding the imports named in `extra` to the given
+    /// addresses (functions of the convention `conv`).
+    pub fn load_with(c: &Compiled, conv: Conv, extra: &[(&str, u64)]) -> Result<Native, String> {
         let code_len = c.code().len().div_ceil(16) * 16;
         let stub_len = 1024;
         let text = (code_len + stub_len).div_ceil(PAGE) * PAGE;
@@ -172,12 +178,32 @@ impl Native {
         image[stubs..stubs + stub_code.len()].copy_from_slice(&stub_code);
         let thunk = addr + (stubs + thunk_off) as u64;
         let trap = addr + (stubs + trap_off) as u64;
+        // Host functions are out of `rel32` reach: each gets a veneer in the
+        // stub area (`mov r11, target; jmp r11`; r11 carries no argument).
+        let mut veneer = stubs + stub_code.len().div_ceil(16) * 16;
         for name in c.imports() {
-            if name == "__lexersketch_trap" {
-                let _ = symbols.insert(name.clone(), trap);
-            } else {
-                return Err(format!("no native binding for import `{name}`"));
+            let target = match name.as_str() {
+                "__lexersketch_trap" => {
+                    let _ = symbols.insert(name.clone(), trap);
+                    continue;
+                }
+                "__lexersketch_pow_f64" | "__lexersketch_pow_f32" => {
+                    pow_binding(name, conv).ok_or("no pow binding")?
+                }
+                other => match extra.iter().find(|(n, _)| *n == other) {
+                    Some(&(_, a)) => a,
+                    None => return Err(format!("no native binding for import `{name}`")),
+                },
+            };
+            let mut v = vec![0x49, 0xBB];
+            v.extend_from_slice(&target.to_le_bytes());
+            v.extend_from_slice(&[0x41, 0xFF, 0xE3]);
+            if veneer + v.len() > text {
+                return Err("too many host functions".into());
             }
+            image[veneer..veneer + v.len()].copy_from_slice(&v);
+            let _ = symbols.insert(name.clone(), addr + veneer as u64);
+            veneer += 16;
         }
         for rel in c.relocations() {
             let s = symbols[&rel.symbol];
@@ -375,4 +401,31 @@ fn thunk(conv: Conv, cells: u64) -> (Vec<u8>, usize, usize) {
     let t = code.label_offset(entry).unwrap();
     let p = code.label_offset(trap).unwrap();
     (code.into_bytes(), t, p)
+}
+
+extern "sysv64" fn pow_f64_sysv(x: u64, y: u64) -> u64 {
+    super::load::pow_f64_bits(x, y)
+}
+
+extern "win64" fn pow_f64_win64(x: u64, y: u64) -> u64 {
+    super::load::pow_f64_bits(x, y)
+}
+
+extern "sysv64" fn pow_f32_sysv(x: u32, y: u32) -> u32 {
+    super::load::pow_f32_bits(x, y)
+}
+
+extern "win64" fn pow_f32_win64(x: u32, y: u32) -> u32 {
+    super::load::pow_f32_bits(x, y)
+}
+
+/// The address of the runtime's float pow for `conv`.
+fn pow_binding(name: &str, conv: Conv) -> Option<u64> {
+    let f64_pow = name.ends_with("f64");
+    Some(match (conv, f64_pow) {
+        (Conv::SysV, true) => pow_f64_sysv as extern "sysv64" fn(u64, u64) -> u64 as usize as u64,
+        (Conv::Win64, true) => pow_f64_win64 as extern "win64" fn(u64, u64) -> u64 as usize as u64,
+        (Conv::SysV, false) => pow_f32_sysv as extern "sysv64" fn(u32, u32) -> u32 as usize as u64,
+        (Conv::Win64, false) => pow_f32_win64 as extern "win64" fn(u32, u32) -> u32 as usize as u64,
+    })
 }

@@ -458,3 +458,214 @@ fn test_imports_and_runtime_symbols_are_relocations() {
     assert!(kinds.contains(&("msg", RelocKind::Pc32)));
     assert!(c.exports().iter().any(|e| e == "f"));
 }
+
+#[test]
+fn test_floats_move_as_bit_patterns_and_pow_calls_the_runtime() {
+    // Arithmetic other than pow is refused with its reason.
+    let mut m = Module::new("x");
+    let f = m
+        .declare_function(
+            "f",
+            &Signature::new(&[Type::U64], &[Type::U64]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(f).unwrap();
+    let x = b.param(0).unwrap();
+    let fx = b
+        .convert(ir_lang::ConvOp::Bitcast, Policy::NONE, x, Type::F64)
+        .unwrap();
+    let s = b.binary(BinaryOp::Add, Policy::NONE, fx, fx).unwrap();
+    let r = b
+        .convert(ir_lang::ConvOp::Bitcast, Policy::NONE, s, Type::U64)
+        .unwrap();
+    b.ret(&[r]).unwrap();
+    assert!(refused(&m).contains("P11"));
+
+    // Constants, bitcasts, a store and a load, a select, and an edge carry a
+    // float's bits unchanged; pow calls the runtime routine for its type
+    // under the C convention, with the bits in integer registers.
+    let mut m = Module::new("x");
+    let f = m
+        .declare_function(
+            "f",
+            &Signature::new(&[Type::U64, Type::U32], &[Type::U64]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(f).unwrap();
+    let (x, y) = (b.param(0).unwrap(), b.param(1).unwrap());
+    let fx = b
+        .convert(ir_lang::ConvOp::Bitcast, Policy::NONE, x, Type::F64)
+        .unwrap();
+    let half = b.f64const(0.5).unwrap();
+    let root = b.binary(BinaryOp::Pow, Policy::NONE, fx, half).unwrap();
+    let fy = b
+        .convert(ir_lang::ConvOp::Bitcast, Policy::NONE, y, Type::F32)
+        .unwrap();
+    let two = b.f32const(2.0).unwrap();
+    let sq = b.binary(BinaryOp::Pow, Policy::NONE, fy, two).unwrap();
+    let slot = b.stack_slot(8, 8).unwrap();
+    let at = b.stack_addr(slot).unwrap();
+    let _ = b.store(sq, at, MemFlags::new(4)).unwrap();
+    let sq = b.load(Type::F32, at, MemFlags::new(4)).unwrap();
+    let zero = b.iconst(Type::U64, 0).unwrap();
+    let c = b.compare(ir_lang::CmpOp::Ne, x, zero).unwrap();
+    let pick = b.select(c, root, half).unwrap();
+    let join = b.create_block(&[Type::F64, Type::F32]).unwrap();
+    b.jump(join, &[pick, sq]).unwrap();
+    b.switch_to(join).unwrap();
+    let (p, q) = (
+        b.block_param(join, 0).unwrap(),
+        b.block_param(join, 1).unwrap(),
+    );
+    let p = b
+        .convert(ir_lang::ConvOp::Bitcast, Policy::NONE, p, Type::U64)
+        .unwrap();
+    let q = b
+        .convert(ir_lang::ConvOp::Bitcast, Policy::NONE, q, Type::U32)
+        .unwrap();
+    let q = b
+        .convert(ir_lang::ConvOp::Zext, Policy::NONE, q, Type::U64)
+        .unwrap();
+    let r = b.binary(BinaryOp::Xor, Policy::NONE, p, q).unwrap();
+    b.ret(&[r]).unwrap();
+    let c = backend_lang::compile(&m, &Options::sysv()).unwrap();
+    assert_eq!(
+        c.imports(),
+        ["__lexersketch_pow_f32", "__lexersketch_pow_f64"]
+    );
+    let renamed = Options::sysv().with_pow_runtime("rt_pow", "rt_powf");
+    let c = backend_lang::compile(&m, &renamed).unwrap();
+    assert_eq!(c.imports(), ["rt_pow", "rt_powf"]);
+    for (x, y) in [
+        (16.0f64, 3.0f32),
+        (2.0, -1.5),
+        (0.0, 0.0),
+        (f64::INFINITY, f32::NAN),
+    ] {
+        agree(&m, f, &[Val::u64(x.to_bits()), Val::u32(y.to_bits())]);
+    }
+}
+
+/// Several `check`s whose error edges an optimizer has proven dead all point
+/// at one shared block ending in `unreachable` (opt-lang 0.3's shape), with
+/// or without the error code as the block's parameter.
+fn shared_unreachable(with_code: bool) -> (Module, FuncId) {
+    use ir_lang::{BlockArg, DivZero, InstData};
+    let mut m = Module::new("dead_edges");
+    let f = m
+        .declare_function(
+            "f",
+            &Signature::new(&[Type::I32, Type::I32, Type::U8], &[Type::I32]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(f).unwrap();
+    let (x, y, s) = (
+        b.param(0).unwrap(),
+        b.param(1).unwrap(),
+        b.param(2).unwrap(),
+    );
+    let dead = if with_code {
+        b.create_block(&[Type::U32]).unwrap()
+    } else {
+        b.create_block(&[]).unwrap()
+    };
+    let to_dead = || {
+        if with_code {
+            BlockCall::with_args(dead, &[BlockArg::ErrorCode])
+        } else {
+            BlockCall::new(dead, &[])
+        }
+    };
+    let ops = [
+        InstData::Binary {
+            op: BinaryOp::Add,
+            policy: Policy::overflow(Overflow::Error),
+            args: [x, y],
+        },
+        InstData::Binary {
+            op: BinaryOp::Div,
+            policy: Policy::overflow(Overflow::Error).with_div_zero(DivZero::Error),
+            args: [x, y],
+        },
+        InstData::Binary {
+            op: BinaryOp::Pow,
+            policy: Policy::overflow(Overflow::Error),
+            args: [s, s],
+        },
+    ];
+    let mut acc = x;
+    for (k, op) in ops.into_iter().enumerate() {
+        let ty = if k == 2 { Type::U8 } else { Type::I32 };
+        let ok = b.create_block(&[ty]).unwrap();
+        b.check(
+            op,
+            BlockCall::with_args(ok, &[BlockArg::Result(0)]),
+            to_dead(),
+        )
+        .unwrap();
+        b.switch_to(ok).unwrap();
+        let r = b.block_param(ok, 0).unwrap();
+        let r = if k == 2 {
+            b.convert(ir_lang::ConvOp::Zext, Policy::NONE, r, Type::I32)
+                .unwrap()
+        } else {
+            r
+        };
+        acc = b.binary(BinaryOp::Xor, Policy::NONE, acc, r).unwrap();
+    }
+    b.ret(&[acc]).unwrap();
+    b.switch_to(dead).unwrap();
+    b.unreachable().unwrap();
+    drop(b);
+    (m, f)
+}
+
+#[test]
+fn test_check_error_edges_into_a_shared_unreachable_block() {
+    for with_code in [false, true] {
+        let (m, f) = shared_unreachable(with_code);
+        m.validate().unwrap_or_else(|e| panic!("{e}\n{m}"));
+        // Inputs for which no check fires: the dead edges are never taken.
+        for (x, y, s) in [(7i32, 3i32, 2u8), (-100, 9, 1), (1 << 20, -5, 0), (0, 1, 3)] {
+            agree(&m, f, &[Val::i32(x), Val::i32(y), Val::u8(s)]);
+        }
+        // If one does fire after all, the code stops at the `unreachable`
+        // (`ud2`), where the interpreter reports reaching it.
+        let args = [Val::i32(5), Val::i32(0), Val::u8(1)];
+        assert!(interp::run(&m, f, &args).is_err());
+        let c = backend_lang::compile(&m, &Options::sysv()).unwrap();
+        let img = load::load(&c).unwrap();
+        let mut mach = load::machine(&img);
+        let mut hosts = Hosts::new(&img, Conv::SysV);
+        let stop = load::call(&img, &mut mach, Conv::SysV, "f", &[5, 0, 1], &mut hosts, 1);
+        assert!(matches!(stop, Ok(Stop::Ud2(_))), "{stop:?}");
+        #[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+        {
+            use common::native::{Native, Ran};
+            let conv = if cfg!(windows) {
+                Conv::Win64
+            } else {
+                Conv::SysV
+            };
+            let c = backend_lang::compile(&m, &Options::host()).unwrap();
+            let n = Native::load(&c, conv).unwrap();
+            for (x, y, s) in [(7i32, 3i32, 2u8), (-100, 9, 1), (0, 1, 3)] {
+                let want =
+                    match interp::run(&m, f, &[Val::i32(x), Val::i32(y), Val::u8(s)]).unwrap() {
+                        Outcome::Return(v) => v[0].bits(),
+                        other => panic!("{other:?}"),
+                    };
+                match n
+                    .call("f", &[x as u32 as u64, y as u32 as u64, u64::from(s)])
+                    .unwrap()
+                {
+                    Ran::Returned(r, _) => assert_eq!(r & 0xFFFF_FFFF, want),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+}

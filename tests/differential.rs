@@ -344,6 +344,7 @@ fn timing_big() {
             statements: stmts,
             traps: false,
             calls: false,
+            ops_v2: false,
             ..GenOptions::default()
         };
         let prog = irgen::generate(1, &opts);

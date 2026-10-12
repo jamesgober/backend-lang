@@ -21,6 +21,98 @@
 
 ---
 
+## [0.4.0] - 2026-10-12
+
+ir-lang 2.0.0-alpha.3 and OPS v2: integer and float `pow` and saturating
+shifts selected and checked against ir-lang's interpreter, natively too;
+SSA from ir-lang's variables API and statepoints from its
+`insert_statepoints` tested as produced; and the register allocator no
+longer reruns liveness on every spill round, which takes the 100,000-instruction
+compile benchmark above 1M IR instructions per second (ISSUES P37, P32).
+
+### Breaking
+
+- **ir-lang `=2.0.0-alpha.3`** (was `=2.0.0-alpha.1`), re-exported as
+  `backend_lang::ir_lang`: modules must be built with alpha.3. Its own breaking
+  changes apply to what reaches the backend: a signed `pow` and a signed
+  saturating shift exist only as the operation of a `check`
+  (`BinaryOp::can_error(policy, ty)`), and a negative `pow` exponent is the
+  `NegativeExponent` error (code 6) under every policy, `trap` included
+  (ISSUES P36), so it arrives on the `check`'s error edge, never as a trap.
+- **Float values are selected where they only move.** Float constants,
+  `bitcast` between a float and the integer of its width, float loads and
+  stores, `select`, and float block parameters and edge arguments compile
+  (bit patterns in general-purpose registers) instead of being refused, and
+  float `pow` calls the runtime. A module using them now imports
+  `__lexersketch_pow_f64`/`__lexersketch_pow_f32` when it uses `pow`. Float
+  arithmetic, comparisons, int/float conversions, and float arguments and
+  results are still refused (`IselError::Unsupported`, ISSUES P11).
+- **`Allocation::max_pressure`** is the pressure before any spilling (the
+  function's demand), measured once; 0.3 reported the final round's.
+
+### Added
+
+- **Integer `pow`** under `wrap`, `trap`, and `error` on every integer type:
+  repeated squaring, unrolled for a constant exponent (at most 64 squarings
+  and 64 multiplications), a loop over the exponent's bits otherwise (at
+  most 64 iterations); overflow checked after every product (`imul` at 64
+  bits, `mul` for `u64`, exact 64-bit products and a final range check for
+  8/16/32-bit types); a negative signed exponent to the error edge with
+  code 6.
+- **`shift = saturate`**: a constant amount folds; a run-time amount is
+  tested for sign on signed types (`ShiftOutOfRange` edge, code 3), then a
+  `cmov` gives zero (left and logical right shifts) or the count is clamped
+  to `width - 1` (arithmetic right shifts).
+- **Float `pow`**: a call under the C convention to the runtime routine
+  named by `Options::pow_f64_symbol` / `pow_f32_symbol` (defaults
+  `"__lexersketch_pow_f64"`, `"__lexersketch_pow_f32"`), with the operands'
+  bit patterns in the first two integer argument registers and the result's
+  in the first return register. The routine must be ir-lang's `ls_pow` (for
+  `f32`, the widened operands, rounded once), so the bits match every other
+  tier. `Options::with_pow_runtime(f64_pow, f32_pow)` renames them.
+- Tests: OPS v2 conformance (`pow` × 3 policies and saturating shifts on
+  every type and edge value, by run-time operands and by every edge-value
+  constant), float `pow` against `ls_pow` bit for bit (`tests/ops.rs`); the
+  random program generator emits OPS v2 and float `pow`
+  (`tests/common/irgen.rs`); variables-API programs
+  (`tests/variables.rs`); `insert_statepoints` programs under the moving
+  collector and natively, and on `invoke`s (`tests/stackmaps.rs`); hostile
+  and huge inputs and the live budget (`tests/hostile.rs`); a `check` whose
+  error edge goes to a shared `unreachable` block (`tests/select.rs`); the
+  allocator's errors equal `verify_ssa`'s on hostile MIR
+  (`tests/regalloc.rs`).
+- Example `ops_v2`.
+
+### Changed
+
+- **Register allocation is incremental across spill rounds.** A use index
+  (definitions and use positions) is built once, in a walk that also checks
+  dominance; liveness is analysed once; affinities are collected once. Each
+  spill round reports what it changed, and the live sets, last uses,
+  fixed-register facts, and affinities are updated in place (exactly: spill
+  code reads and writes no physical register, a spilled value leaves every
+  live-in set, a temporary lives only before its user). Spill rewriting
+  visits only the spilled values' uses; only blocks that received code are
+  rebuilt, with an O(1) lookup per instruction; the final substitution
+  rewrites operands in place. The live budget applies to the one analysis.
+  Allocated code can differ from 0.3's in which values spill and where
+  temporaries go (the coloring itself is unchanged).
+- Documentation: the crate docs, `isel` and `regalloc` module docs, README,
+  and `docs/API.md` describe OPS v2, floats as bit patterns, the runtime's
+  `pow` contract, and the allocator's cost model.
+
+### Migrating from 0.3
+
+| 0.3 | 0.4 |
+|---|---|
+| Building modules with `ir-lang = "=2.0.0-alpha.1"` | Build with `=2.0.0-alpha.3` (or use `backend_lang::ir_lang`) |
+| A front end placing a signed `pow` as a plain instruction | ir-lang refuses it: put it in a `check`; the error edge receives 6 for a negative exponent |
+| Expecting float constants, bitcasts, loads, or `select` to be refused | They compile; float arithmetic other than `pow` is still refused |
+| A runtime providing `__lexersketch_trap`, `__lexersketch_gc_poll`, `__lexersketch_resume` | Also `__lexersketch_pow_f64(u64, u64) -> u64` and `__lexersketch_pow_f32(u32, u32) -> u32` (C convention, bit patterns) when modules use float `pow`: `ir_lang::ls_pow` on the bits |
+| `Allocation::max_pressure()` as the final round's pressure | It is the pressure before spilling |
+
+---
+
 ## [0.3.0] - 2026-10-09
 
 ir-lang 2.0 to running x86-64 code: instruction selection for the integer,
@@ -166,7 +258,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/backend-lang/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/backend-lang/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/backend-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/backend-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/backend-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/backend-lang/releases/tag/v0.1.0

@@ -207,6 +207,7 @@ fn compile(c: &mut Criterion) {
         statements: 20_000,
         traps: false,
         calls: false,
+        ops_v2: false,
         ..common::irgen::GenOptions::default()
     };
     let p = common::irgen::generate(1, &opts_gen);

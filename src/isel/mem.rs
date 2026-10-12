@@ -111,10 +111,8 @@ impl Sel<'_> {
             InstData::Load { ty, addr, .. } | InstData::AtomicLoad { ty, addr, .. } => {
                 // x86-64 loads are atomic when aligned (IR.md requires natural
                 // alignment for atomics) and acquire under TSO.
+                // A float loads as its bit pattern.
                 let r = r.ok_or(MirError::Limit)?;
-                if ty.is_float() {
-                    return self.unsupported("floating-point loads wait on isa-lang's SSE forms (ISSUES P11)");
-                }
                 let m = self.mem_operand(addr)?;
                 let d = self.emit_def(load_op(ty), &[m])?;
                 self.set_val(r, d);
@@ -125,7 +123,7 @@ impl Sel<'_> {
                 if order == MemOrder::SeqCst {
                     // A sequentially consistent store needs a full barrier:
                     // xchg with memory is implicitly locked.
-                    let ty = self.ty(value)?;
+                    let ty = self.ty_any(value)?;
                     let m = self.mem_operand(addr)?;
                     let v = self.val(value)?;
                     let _ = self.emit_def(xchg_op(ty), &[m, v.into()])?;
@@ -224,7 +222,7 @@ impl Sel<'_> {
     }
 
     fn store(&mut self, value: Value, addr: Value) -> Result<()> {
-        let ty = self.ty(value)?;
+        let ty = self.ty_any(value)?;
         let m = self.mem_operand(addr)?;
         let (opcode, range) = match bits(ty) {
             8 => (op::STORE8, ImmRange::I8),
@@ -395,7 +393,7 @@ fn load_op(ty: Type) -> Opcode {
         Type::I8 => op::MOVSX8TO32,
         Type::U16 => op::MOVZX16,
         Type::I16 => op::MOVSX16TO32,
-        Type::I32 | Type::U32 => op::MOV32,
+        Type::I32 | Type::U32 | Type::F32 => op::MOV32,
         _ => op::MOV64,
     }
 }

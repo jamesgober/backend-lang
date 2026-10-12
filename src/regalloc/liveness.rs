@@ -1,18 +1,26 @@
 //! Liveness and constraints: live-in sets by SSA path exploration, then one
 //! backward walk per block for last uses, physical-register liveness, and
 //! the registers written while each value is live.
+//!
+//! The analysis runs once per allocation. A spill round changes liveness in
+//! a way that can be stated exactly (every spilled value leaves every live-in
+//! set; each new temporary lives from just before its user to its user; a
+//! stored value from its definition to the store after it; spill code reads
+//! and writes no physical register), so [`Analysis::update`] applies those
+//! changes in time proportional to the live sets and the spill code instead
+//! of exploring paths and walking every block again.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::RegAllocError;
-use super::rewrite::SpillState;
+use super::rewrite::{Def, SpillReport, UseIndex};
 use crate::mir::cfg::{Cfg, NONE};
-use crate::mir::visit::{Access, def_count};
+use crate::mir::visit::Access;
 use crate::mir::{Block, Function, ImplicitKind, Inst};
 use crate::regs::{MAX_PREGS, Reg, RegSet};
 
-/// Everything the coloring needs to know about one round's function.
+/// Everything the coloring needs to know about the function.
 pub(crate) struct Analysis<'c> {
     pub(crate) cfg: &'c Cfg,
     /// Values live into each block (CSR by block).
@@ -23,6 +31,11 @@ pub(crate) struct Analysis<'c> {
     kills: Vec<u32>,
     /// Physical registers live after each instruction, by instruction id.
     pub(crate) phys_after: Vec<RegSet>,
+    /// The tracked physical registers each instruction writes and reads,
+    /// for the instructions that touch any: an index into `fx_sets` by
+    /// instruction id, `NONE` for none.
+    fx: Vec<u32>,
+    fx_sets: Vec<[RegSet; 2]>,
     /// Registers written while each value is live (not counting its own
     /// definition), by virtual register.
     pub(crate) forbidden: Vec<RegSet>,
@@ -33,6 +46,7 @@ pub(crate) struct Analysis<'c> {
     /// The physical registers any instruction may hand out: allocatable and
     /// not reserved for the frame.
     pub(crate) tracked: RegSet,
+    /// The most values of one class live at once, before any spilling.
     pub(crate) max_pressure: u32,
 }
 
@@ -51,6 +65,171 @@ impl Analysis<'_> {
         match (self.kill_start.get(i), self.kill_start.get(i + 1)) {
             (Some(&s), Some(&e)) => self.kills.get(s as usize..e as usize).unwrap_or(&[]),
             _ => &[],
+        }
+    }
+
+    /// The tracked physical registers `inst` writes (definitions, implicit
+    /// definitions, clobbers).
+    pub(crate) fn writes(&self, inst: Inst) -> RegSet {
+        self.fx_of(inst)[0]
+    }
+
+    /// The tracked physical registers `inst` reads.
+    pub(crate) fn reads(&self, inst: Inst) -> RegSet {
+        self.fx_of(inst)[1]
+    }
+
+    fn fx_of(&self, inst: Inst) -> [RegSet; 2] {
+        match self.fx.get(inst.index()) {
+            Some(&k) if k != NONE => self
+                .fx_sets
+                .get(k as usize)
+                .copied()
+                .unwrap_or([RegSet::EMPTY; 2]),
+            _ => [RegSet::EMPTY; 2],
+        }
+    }
+
+    /// Applies a spill round's changes (see the module documentation).
+    pub(crate) fn update(&mut self, f: &Function, report: &SpillReport) {
+        let nv = f.vreg_count();
+        let ni = f.inst_count();
+        let mut gone = vec![false; nv];
+        for &v in &report.spilled {
+            if let Some(g) = gone.get_mut(v as usize) {
+                *g = true;
+            }
+        }
+        let keep = |v: u32| !gone.get(v as usize).copied().unwrap_or(false);
+
+        // Live-in sets: the spilled values leave them.
+        let nb = self.live_start.len().saturating_sub(1);
+        let mut live = Vec::with_capacity(self.live.len());
+        let mut live_start = Vec::with_capacity(nb + 1);
+        for b in 0..nb {
+            live_start.push(live.len() as u32);
+            live.extend(self.live_in(b).iter().copied().filter(|&v| keep(v)));
+        }
+        live_start.push(live.len() as u32);
+        self.live = live;
+        self.live_start = live_start;
+
+        // Last uses: the spilled values' go; each temporary dies at its user,
+        // each stored value at its store.
+        let mut extra: Vec<(u32, u32)> =
+            Vec::with_capacity(report.temps.len() + report.stored.len());
+        extra.extend(
+            report
+                .temps
+                .iter()
+                .map(|&(t, _, user)| (user.index() as u32, t)),
+        );
+        extra.extend(
+            report
+                .stored
+                .iter()
+                .map(|&(v, _, store)| (store.index() as u32, v)),
+        );
+        let mut count = vec![0u32; ni + 1];
+        let old_ni = self.kill_start.len().saturating_sub(1);
+        for i in 0..old_ni {
+            let n = self
+                .kills(Inst::from_index(i))
+                .iter()
+                .filter(|&&v| keep(v))
+                .count();
+            count[i + 1] = n as u32;
+        }
+        for &(i, _) in &extra {
+            if let Some(c) = count.get_mut(i as usize + 1) {
+                *c += 1;
+            }
+        }
+        for k in 0..ni {
+            count[k + 1] += count[k];
+        }
+        let mut kills = vec![0u32; count[ni] as usize];
+        let mut fill = count.clone();
+        for i in 0..old_ni {
+            for &v in self.kills(Inst::from_index(i)) {
+                if keep(v) {
+                    kills[fill[i] as usize] = v;
+                    fill[i] += 1;
+                }
+            }
+        }
+        for &(i, v) in &extra {
+            if let Some(at) = fill.get_mut(i as usize) {
+                if let Some(slot) = kills.get_mut(*at as usize) {
+                    *slot = v;
+                }
+                *at += 1;
+            }
+        }
+        self.kills = kills;
+        self.kill_start = count;
+
+        // Physical registers after the new instructions: a temporary's
+        // definition sits just before its user, so what is live after it is
+        // what is live into the user; a store sits just after a definition.
+        self.phys_after.resize(ni, RegSet::EMPTY);
+        self.fx.resize(ni, NONE);
+        for &(_, def, user) in &report.temps {
+            let before = self
+                .phys_after
+                .get(user.index())
+                .copied()
+                .unwrap_or(RegSet::EMPTY)
+                .difference(self.writes(user))
+                .union(self.reads(user));
+            if let Some(p) = self.phys_after.get_mut(def.index()) {
+                *p = before;
+            }
+        }
+        for &(_, def, store) in &report.stored {
+            let after = self
+                .phys_after
+                .get(def.index())
+                .copied()
+                .unwrap_or(RegSet::EMPTY);
+            if let Some(p) = self.phys_after.get_mut(store.index()) {
+                *p = after;
+            }
+        }
+
+        // Per-value facts for the new temporaries and the stored values.
+        self.forbidden.resize(nv, RegSet::EMPTY);
+        self.uses.resize(nv, 0);
+        self.span.resize(nv, 0);
+        for &(t, _, user) in &report.temps {
+            let mut n = 0u32;
+            f.visit_regs(user, |_, r, access| {
+                if access == Access::Use && r.as_virt().is_some_and(|x| x.index() as u32 == t) {
+                    n += 1;
+                }
+            });
+            let i = t as usize;
+            if let (Some(fb), Some(u), Some(s)) = (
+                self.forbidden.get_mut(i),
+                self.uses.get_mut(i),
+                self.span.get_mut(i),
+            ) {
+                *fb = RegSet::EMPTY;
+                *u = n;
+                *s = 1;
+            }
+        }
+        for &(v, _, _) in &report.stored {
+            let i = v as usize;
+            if let (Some(fb), Some(u), Some(s)) = (
+                self.forbidden.get_mut(i),
+                self.uses.get_mut(i),
+                self.span.get_mut(i),
+            ) {
+                *fb = RegSet::EMPTY;
+                *u = 1;
+                *s = 1;
+            }
         }
     }
 }
@@ -165,83 +344,44 @@ impl SparseSet {
     }
 }
 
-/// Analyzes `f` for one coloring round.
+/// Analyzes `f`, whose definitions and uses `index` lists.
 pub(crate) fn analyze<'c>(
     f: &Function,
     cfg: &'c Cfg,
-    state: &SpillState,
+    index: &UseIndex,
     budget: usize,
 ) -> Result<Analysis<'c>, RegAllocError> {
     let nb = f.block_count();
     let nv = f.vreg_count();
     let ni = f.inst_count();
-    let _ = state;
 
     // Definitions: block of each value.
-    let mut def_block = vec![NONE; nv];
-    for &b in &cfg.rpo {
-        let block = Block::from_index(b as usize);
-        for p in f.params(block) {
-            if let Some(v) = p.reg().and_then(Reg::as_virt) {
-                def_block[v.index()] = b;
-            }
-        }
-        for &inst in f.insts(block) {
-            let n = def_count(f, inst);
-            for op in f.operands(inst).iter().take(n) {
-                if let Some(v) = op.reg().and_then(Reg::as_virt) {
-                    def_block[v.index()] = b;
-                }
-            }
-        }
-    }
+    let def_block: Vec<u32> = index
+        .def
+        .iter()
+        .map(|d| match *d {
+            Def::None => NONE,
+            Def::Param { block, .. } => block.index() as u32,
+            Def::Inst(inst) => f.inst_block(inst).map_or(NONE, |b| b.index() as u32),
+        })
+        .collect();
 
-    // Uses outside the defining block, bucketed by value.
-    let mut outside: Vec<(u32, u32)> = Vec::new();
-    for &b in &cfg.rpo {
-        let block = Block::from_index(b as usize);
-        for &inst in f.insts(block) {
-            f.visit_regs(inst, |_, r, access| {
-                if let (Access::Use, Some(v)) = (access, r.as_virt()) {
-                    if def_block.get(v.index()).is_some_and(|&d| d != b) {
-                        outside.push((v.index() as u32, b));
-                    }
-                }
-            });
-        }
-    }
-    // Bucket by value in linear time (a counting sort); duplicates are
-    // harmless, the walk below skips blocks already marked.
-    let mut start = vec![0u32; nv + 1];
-    for &(v, _) in &outside {
-        start[v as usize + 1] += 1;
-    }
-    for k in 0..nv {
-        start[k + 1] += start[k];
-    }
-    let mut sorted = vec![(0u32, 0u32); outside.len()];
-    {
-        let mut fill = start.clone();
-        for &(v, b) in &outside {
-            sorted[fill[v as usize] as usize] = (v, b);
-            fill[v as usize] += 1;
-        }
-    }
-    let outside = sorted;
-
-    // Path exploration: for each value, walk up from its outside uses to its
-    // definition, marking it live-in on the way.
+    // Path exploration: for each value, walk up from its uses outside its
+    // definition's block to the definition, marking it live-in on the way.
     let mut mark = vec![NONE; nb];
     let mut pairs: Vec<(u32, u32)> = Vec::new(); // (block, value)
     let mut stack: Vec<u32> = Vec::new();
-    let mut i = 0;
-    while i < outside.len() {
-        let v = outside[i].0;
-        let d = def_block[v as usize];
-        while i < outside.len() && outside[i].0 == v {
-            stack.push(outside[i].1);
-            i += 1;
+    for (v, &d) in def_block.iter().enumerate().take(nv) {
+        for &(inst, _) in index.uses(v) {
+            if index.is_dead(inst) {
+                continue;
+            }
+            let b = f.inst_block(inst).map_or(NONE, |b| b.index() as u32);
+            if b != d && b != NONE {
+                stack.push(b);
+            }
         }
+        let v = v as u32;
         while let Some(b) = stack.pop() {
             if b == d || mark[b as usize] == v {
                 continue;
@@ -294,6 +434,8 @@ pub(crate) fn analyze<'c>(
         kill_start: Vec::new(),
         kills: Vec::new(),
         phys_after: vec![RegSet::EMPTY; ni],
+        fx: vec![NONE; ni],
+        fx_sets: Vec::new(),
         forbidden: vec![RegSet::EMPTY; nv],
         uses: vec![0; nv],
         span: vec![0; nv],
@@ -308,6 +450,8 @@ pub(crate) fn analyze<'c>(
     let mut last_set = [0u64; MAX_PREGS];
     let mut cp = 0u64;
     let mut pos = 0u64;
+    // `last_set` only grows with `cp`, so a memo keyed by (open, now) holds.
+    let mut memo = (u64::MAX, u64::MAX, RegSet::EMPTY);
     let mut kill_pairs: Vec<(u32, u32)> = Vec::new(); // (inst, value)
     let mut pressure = vec![0u32; target.classes().len()];
     let mut defs_here: Vec<u32> = Vec::new();
@@ -366,6 +510,7 @@ pub(crate) fn analyze<'c>(
                         pos,
                         &last_set,
                         cp,
+                        &mut memo,
                     );
                     let c = super::class_of(f, crate::regs::VReg::from_index(d)).index();
                     if let Some(p) = pressure.get_mut(c) {
@@ -389,6 +534,12 @@ pub(crate) fn analyze<'c>(
                     puses.intersect(tracked),
                 )
             };
+            if !w.is_empty() || !reads.is_empty() {
+                if let Some(slot) = an.fx.get_mut(inst.index()) {
+                    *slot = an.fx_sets.len() as u32;
+                    an.fx_sets.push([w, reads]);
+                }
+            }
             if !w.is_empty() {
                 cp += 1;
                 for r in w.iter() {
@@ -429,6 +580,7 @@ pub(crate) fn analyze<'c>(
                 pos,
                 &last_set,
                 cp,
+                &mut memo,
             );
         }
         let entry_params: RegSet = if an.cfg.rpo.first() == Some(&b) {
@@ -469,6 +621,10 @@ pub(crate) fn analyze<'c>(
 /// Ends value `v`'s segment that opened at constraint count `open` and
 /// position `from`: every register written at a constraint point since then
 /// is forbidden for it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the walk's state, one call shape"
+)]
 fn close(
     an: &mut Analysis,
     v: u32,
@@ -477,15 +633,25 @@ fn close(
     to: u64,
     last_set: &[u64; MAX_PREGS],
     now: u64,
+    memo: &mut (u64, u64, RegSet),
 ) {
     // No constraint point since the segment opened: nothing to add.
     if now > open {
-        let mut add = RegSet::EMPTY;
-        for r in an.tracked.iter() {
-            if last_set[r.index()] > open {
-                add = add.with(r);
+        // Segments closing together mostly opened together (every value
+        // live through a block opens at its end and closes at its start),
+        // so the mask of one (open, now) pair serves them all.
+        let add = if memo.0 == open && memo.1 == now {
+            memo.2
+        } else {
+            let mut add = RegSet::EMPTY;
+            for r in an.tracked.iter() {
+                if last_set[r.index()] > open {
+                    add = add.with(r);
+                }
             }
-        }
+            *memo = (open, now, add);
+            add
+        };
         if let Some(slot) = an.forbidden.get_mut(v as usize) {
             *slot = slot.union(add);
         }

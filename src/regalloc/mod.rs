@@ -15,7 +15,8 @@
 //! 1. **Liveness** by SSA path exploration: from each use outside its
 //!    definition's block, walk predecessors up to the definition, marking
 //!    the value live-in on the way. Cost is the size of the live sets, with
-//!    an explicit budget.
+//!    an explicit budget. It runs once: definitions and uses come from an
+//!    index built in one walk, and spill rounds update it (below).
 //! 2. **Constraints** in one backward walk per block: which uses are last
 //!    uses, which physical registers are live after each instruction, and,
 //!    for each value, every register written while it is live (a call's
@@ -44,10 +45,20 @@
 //!    reloaded into a short-lived temporary before each use that cannot read
 //!    the slot directly (x86-64 reads one memory operand per instruction,
 //!    and branch arguments and copies read slots as they are). A spilled
-//!    block parameter simply lives in its slot. The allocation then reruns;
+//!    block parameter simply lives in its slot. Coloring then reruns;
 //!    temporaries are never spilled, so each round spills at least one more
 //!    long-lived value, and after [`MAX_ROUNDS`] every remaining long-lived
 //!    value is spilled, which always succeeds.
+//! 6. **Incremental updates between rounds.** Spill code changes liveness in
+//!    a way that can be stated exactly: every spilled value leaves every
+//!    live-in set (it is gone, or lives only from its definition to the
+//!    store after it); each reload temporary lives from just before its user
+//!    to the user; and spill code reads and writes no physical register. So
+//!    the live sets, last uses, and fixed-register facts are updated in time
+//!    proportional to the live sets and the spill code, the affinities only
+//!    at the instructions that now read a temporary, and only the blocks that
+//!    received spill code are rebuilt: a round costs one coloring walk, not a
+//!    liveness analysis.
 //!
 //! **Callee-saved registers** are used like any other; a value live across a
 //! call can only sit in one (the call clobbers the rest), and the frame
@@ -332,7 +343,8 @@ impl Allocation {
         self.rematerialized
     }
 
-    /// The most values of one class live at once in the final round.
+    /// The most values of one class live at once, before any spilling: the
+    /// register pressure the function itself demands.
     ///
     /// # Examples
     ///
@@ -433,21 +445,27 @@ pub fn allocate(f: &mut Function) -> Result<Allocation, RegAllocError> {
 /// ```
 pub fn allocate_with(f: &mut Function, options: &Options) -> Result<Allocation, RegAllocError> {
     // The control-flow graph never changes during allocation (spill code
-    // and dead-code removal touch no branch), so it is built once.
+    // and dead-code removal touch no branch), so it is built once; so are
+    // the use index, the liveness analysis, and the affinities, which spill
+    // rounds update in place.
     f.verify()?;
     let cfg = Cfg::new(f);
-    f.check_dominance(&cfg)?;
+    // Checks dominance as it goes (`Function::verify_ssa`'s rule).
+    let mut index = rewrite::UseIndex::new(f, &cfg)?;
     let mut state = rewrite::SpillState::new(f);
-    rewrite::remove_dead_pure(f, &cfg, &mut state)?;
+    rewrite::remove_dead_pure(f, &mut index);
+    let mut analysis = liveness::analyze(f, &cfg, &index, options.live_budget)?;
+    let mut prefs = color::Affinities::new(f, &analysis);
     let mut rounds = 0u32;
     loop {
         rounds += 1;
         let last = rounds > MAX_ROUNDS;
         if last {
-            rewrite::spill_all(f, &cfg, &mut state)?;
+            let report = rewrite::spill_all(f, &mut index, &mut state)?;
+            analysis.update(f, &report);
+            prefs.update(f, &report);
         }
-        let analysis = liveness::analyze(f, &cfg, &state, options.live_budget)?;
-        let colored = color::color(f, &analysis, &state)?;
+        let colored = color::color(f, &analysis, &prefs, &state)?;
         if colored.spill.is_empty() {
             let assignment = if options.keep_assignment {
                 Some((f.clone(), colored.locations.clone()))
@@ -470,7 +488,9 @@ pub fn allocate_with(f: &mut Function, options: &Options) -> Result<Allocation, 
                 .map_or(RegClass::new(0), |&v| class_of(f, v));
             return Err(RegAllocError::NoRegister { class });
         }
-        rewrite::spill(f, &cfg, &mut state, &colored.spill)?;
+        let report = rewrite::spill(f, &mut index, &mut state, &colored.spill)?;
+        analysis.update(f, &report);
+        prefs.update(f, &report);
     }
 }
 

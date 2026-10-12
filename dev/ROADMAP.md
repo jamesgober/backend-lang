@@ -192,7 +192,7 @@ Moved out of v0.3.0, with reasons:
 - **`shift = saturate`** → when ir-lang carries it: OPS v2 defines it, but ir-lang
   2.0.0-alpha.1's `Shift` has only `error` and `mask`, so no ir-lang program can ask for it and
   no oracle can check it. The shift lowering already range-checks the amount; saturation is a
-  `cmov` on the same compare.
+  `cmov` on the same compare. *Delivered in v0.4.0, against ir-lang 2.0.0-alpha.3.*
 - **Floating point and SIMD** (types, operations, conversions, arguments, loads) → v0.5.0:
   isa-lang 0.2 encodes no SSE (ISSUES P11). Refused as `IselError::Unsupported`.
 - **`atomic_rmw` other than `xchg`, and `cmpxchg`** → v0.5.0: they need `lock`-prefixed forms
@@ -207,14 +207,152 @@ Moved out of v0.3.0, with reasons:
 - **Compile throughput (target ≥1M IR instructions/s)**: not met reliably on this machine;
   measured numbers are in the release notes. The allocator reruns liveness and coloring for
   every spill round (two or three on large functions); an incremental later round is v0.9.0
-  work.
+  work. *Delivered in v0.4.0 (ISSUES P32): liveness is analysed once and updated per round.*
+
+## v0.4.0 - ir-lang 2.0.0-alpha.3, OPS v2, compile throughput (DONE)
+The native path from irgen-lang to machine code (ISSUES P37), and the part
+of P32 that fits: OPS v2 selected and checked, allocation without a
+liveness analysis per spill round.
+Exit criteria:
+- [x] `ir-lang = "=2.0.0-alpha.3"` as the dependency and (with `interp`) the
+      dev-dependency; alpha.2's and alpha.3's changes handled (`pow`,
+      `Shift::Saturate`, `can_error(policy, ty)`, the P36 negative-exponent
+      rule, new `BuildError` variants, statepoints from
+      `insert_statepoints`, block parameters from the variables API).
+- [x] Integer `pow` under `wrap`, `trap`, and `error`, with its `check`
+      error edge and code 6; float `pow` bit-identical to `ls_pow`;
+      saturating shifts, negative amounts on the error edge; each checked
+      natively against ir-lang's interpreter.
+- [x] Compile throughput at least 1M IR instructions per second on the
+      existing benchmark (`compile_100k`), measured before and after.
+- [x] Differential tests over OPS v2, programs built through the variables
+      API, and statepoint-carrying functions; hostile and huge inputs.
+
+Delivered:
+- **ir-lang 2.0.0-alpha.3.** Selection follows `BinaryOp::can_error(policy,
+  ty)`: a signed `pow` and a signed saturating shift arrive only as the
+  operation of a `check` (ir-lang refuses them as plain instructions), and
+  the backend lowers whatever failure they raise to that edge, never to the
+  trap block. `Overflow::Trap` still traps (code 1) on an unrepresentable
+  power; a negative exponent is the `NegativeExponent` error (code 6) under
+  every policy (ISSUES P36). The new `BuildError` variants are the builder's
+  and never reach the backend (it reads finished modules). `insert_statepoints`
+  output (GC lists on calls, relocated references as call results, `resN` on
+  both edges of an `invoke`, block parameters where relocated versions meet)
+  needed no change: it is the statepoint form 0.3 already selected, now
+  tested as produced. The variables API's block parameters are ordinary block
+  parameters.
+- **Integer `pow`** (`isel`): repeated squaring, a square taken only while a
+  higher exponent bit remains so every product is a factor of the result.
+  A constant exponent unrolls (at most 64 squarings and 64
+  multiplications); a run-time one loops over its bits (four blocks, at most
+  64 iterations). `wrap` multiplies at 64 bits (the low bits are exact at
+  every width); `trap`/`error` check every product: `imul` overflow at 64
+  bits, `mul`'s for `u64`, and 8/16/32-bit types computed exactly in 64 bits
+  with a range check at the end.
+- **Float `pow`** (`isel`, `Options::{pow_f64_symbol, pow_f32_symbol,
+  with_pow_runtime}`): a call to the runtime's routine, which is ir-lang's
+  `ls_pow` (for `f32`, the widened operands, rounded once). Chosen over
+  compiling `ls_pow`'s algorithm here because that algorithm is IEEE double
+  arithmetic throughout (double-double `log` and `exp`), and isa-lang 0.2
+  encodes no SSE: compiled now, it would be a software-float emulation of
+  every `+ - * /` it does, thousands of instructions per call, replaced
+  wholesale when SSE arrives. The runtime routine is `ls_pow` itself, so the
+  bits are identical by construction, and the tests bind exactly that.
+  The operands and the result travel as bit patterns in integer registers
+  under the C convention, because floats live in general-purpose registers
+  in this release (next item).
+- **Floats as bit patterns**: constants, `bitcast` to and from the integer of
+  the same width, loads, stores (atomic ones included), `select`, block
+  parameters, and edge arguments carry a float's bits in a general-purpose
+  register, so a float can reach `pow` and come back. Float arithmetic,
+  comparisons, int/float conversions, and float arguments and results stay
+  refused (v0.5.0, isa-lang SSE).
+- **Saturating shifts** (`Shift::Saturate`): a constant amount folds (in
+  range: an immediate shift; at or past the width: zero, or a shift by
+  `w - 1` for an arithmetic right shift); a run-time amount is tested for
+  sign (signed types: the `ShiftOutOfRange` edge), then `cmov`s pick zero
+  (left and logical right shifts) or clamp the count to `w - 1` (arithmetic
+  right shifts).
+- **Allocation throughput** (`regalloc`): a use index built once (each
+  value's definition and use positions), liveness analysed once, affinities
+  collected once; each spill round reports what it changed and the live
+  sets, last uses, fixed-register facts, and affinities are updated in place
+  (exact: spill code reads and writes no physical register, every spilled
+  value leaves every live-in set, each temporary lives only before its
+  user). Spill rewriting visits only the spilled values' uses, and only
+  blocks that received code are rebuilt (in O(1) per instruction, not a
+  binary search). Per-instruction physical effects are recorded by the
+  analysis for the coloring instead of recomputed each round, segment
+  constraint masks are memoised per (open, close) pair, and the final
+  substitution rewrites operands in place. Numbers in the release notes.
+- **Tests**: OPS v2 conformance on edge values (`pow` under three policies,
+  saturating shifts, by run-time and by every edge-value constant) in the
+  test interpreter under both conventions and natively; float `pow` against
+  `ls_pow` bit for bit (special values, subnormals, NaN payloads, random
+  magnitudes; run-time and constant exponents; `f64` and `f32`); the random
+  program generator extended with `pow`, saturating shifts (plain and
+  `check`ed), and float `pow` through constants, `select`, memory, and
+  joins; a variables-API program generator (unsealed loop headers, joins,
+  unassigned reads, `check`ed OPS v2 with error edges assigning variables,
+  calls) against the interpreter in the test interpreter and natively;
+  `insert_statepoints` programs under the moving collector (and natively
+  with a non-moving one), and on `invoke`s through the minimal unwinder;
+  hostile and huge inputs (`tests/hostile.rs`: any OPS v2 operation with any
+  constant or run-time operands compiles, terminates, and agrees; all-ones
+  constant exponents unroll to bounded code; a 300,000-instruction function;
+  20,000 nested branches; a 2,000-parameter join; 10,000 `pow` loops in one
+  function; the live budget exact to the entry and unaffected by spill
+  rounds); a `check` whose error edge an optimizer proved dead points at a
+  shared block ending in `unreachable` (opt-lang 0.3's shape): it selects to
+  `ud2` and runs against the interpreter in the test interpreter and
+  natively.
+- **Dominance checked in the index walk**: the allocator's precondition
+  (`Function::verify_ssa`'s rule) is checked while the use index is built,
+  one walk instead of two more; a property test holds the allocator's errors
+  equal to `verify_ssa`'s on hostile MIR.
+
+Dependency wiring (decided here, recorded per the anti-deferral rule):
+- **ir-lang `=2.0.0-alpha.3`: wired** (crates.io, pinned exactly while it is
+  a pre-release; was `=2.0.0-alpha.1`), and its `interp` feature as the
+  test oracle. `backend_lang::ir_lang` re-exports it, so the pin is part of
+  this crate's API.
+- **isa-lang 0.2: wired**, unchanged. **object-lang 0.2: dev-dependency**,
+  unchanged.
+- **irgen-lang 0.2.0: not a dev-dependency, and cannot be.** It pins
+  `ir-lang = "=2.0.0-alpha.2"`; this crate pins `=2.0.0-alpha.3`, and cargo
+  allows one version of a package per semver-compatible range (both are
+  `2.0.0` pre-releases), so resolution fails ("failed to select a version
+  for `ir-lang` ... all possible versions conflict"). The HIR → ir →
+  machine code end-to-end test therefore lives with irgen-lang 0.3 on
+  alpha.3 (ISSUES P37's plan); here, the variables API and
+  `insert_statepoints` (what irgen uses to build its output) are exercised
+  directly.
+
+Moved out of v0.4.0, with reasons:
+- **Live-range splitting** → v0.5.0, as P32 planned: the 1M/s target is met
+  without it on `compile_100k`, and splitting changes code quality, not the
+  allocator's asymptotics. The high-pressure benchmark (`compile_pressure`)
+  remains below 1M IR instructions/s (release notes): its cost is the live
+  sets themselves (dozens of values live through thousands of blocks), which
+  any live-set liveness pays; splitting with interval-based liveness is the
+  fix and belongs with it.
+- **Compiling `ls_pow` instead of calling it** → with SSE (v0.5.0), if
+  inlining ever pays: see the float `pow` item above.
+- Everything 0.3 moved to v0.5.0 stays there (floats and SIMD in vector
+  registers, unwind tables, PIC, `lock`-prefixed atomics, aggregates and
+  sret, AArch64).
 
 ## v0.5.0 - Implementation
 - [ ] AArch64: isa-lang AArch64 forms, the AArch64 description, AAPCS64 (`aapcs64`), the
       frame model (`stp`/`ldp`, frame record), selection, and i-cache coherence for the JIT.
 - [ ] Floating point and SIMD: XMM rows and Win64 vector saves (isa-lang 0.5 SSE, ISSUES
       P11), float selection (OPS §4 exactly: `min`/`max` NaN and signed-zero rules, `round`
-      ties away, `float_to_int` saturate/error), float arguments and results.
+      ties away, `float_to_int` saturate/error), float arguments and results; floats move
+      from general-purpose registers (0.4's bit-pattern carrying) to XMM, and the float
+      `pow` runtime call to the XMM convention or inline `ls_pow`.
+- [ ] Live-range splitting (moved from 0.4, ISSUES P32), with interval liveness, so the
+      high-pressure benchmark (`compile_pressure`) also reaches 1M IR instructions/s.
 - [ ] Unwinding: Win64 `.pdata`/`.xdata` and DWARF CFI from `FrameLayout`, an LSDA from the
       call-site records, a personality routine; `invoke` and landing pads complete.
 - [ ] PIC: GOT-relative addressing of imported data and PLT calls (`R_X86_64_GOTPCREL`,

@@ -1,10 +1,12 @@
 //! Random ir-lang 2.0 programs for differential testing: valid, terminating,
 //! free of undefined behaviour, and dense in the things a backend gets
-//! wrong: every integer operation under every policy, checked operations
-//! with error edges, branches, loops whose back edges permute their
-//! parameters, switches (dense and sparse), stack slots and globals through
-//! field and element addresses, block memory operations, direct and
-//! indirect calls, tail calls, and many values live at once.
+//! wrong: every integer operation under every policy (OPS v2's `pow` and
+//! `shift = saturate` included), checked operations with error edges, float
+//! `pow` on bit patterns (through `bitcast`, constants, `select`, memory, and
+//! edges), branches, loops whose back edges permute their parameters,
+//! switches (dense and sparse), stack slots and globals through field and
+//! element addresses, block memory operations, direct and indirect calls,
+//! tail calls, and many values live at once.
 //!
 //! ir-lang's own generators are internal to its test suite, so this is the
 //! backend's own.
@@ -71,6 +73,10 @@ pub struct GenOptions {
     /// Results per function (1 or 2).
     pub returns: usize,
     pub conv: CallConv,
+    /// OPS v2 (`pow`, `shift = saturate`) and float `pow`. Off, the
+    /// generator draws exactly as it did before they existed, so the
+    /// benchmarks compare the same programs across releases.
+    pub ops_v2: bool,
 }
 
 impl Default for GenOptions {
@@ -84,6 +90,7 @@ impl Default for GenOptions {
             tail_calls: true,
             returns: 1,
             conv: CallConv::Fast,
+            ops_v2: true,
         }
     }
 }
@@ -379,6 +386,8 @@ impl G<'_> {
             73..=82 if self.opts.memory => self.memory(),
             83..=89 if self.opts.calls => self.call(),
             90..=92 if self.opts.memory => self.block_memory(),
+            93..=96 if self.opts.ops_v2 => self.ops_v2(),
+            97..=98 if self.opts.ops_v2 => self.float_pow(),
             _ => self.binary(),
         }
     }
@@ -491,7 +500,8 @@ impl G<'_> {
     /// fallback), the normal edge continues.
     fn check(&mut self) {
         let (a, ty) = self.int_value();
-        let (op, res_ty) = match self.rng.below(7) {
+        let kinds = if self.opts.ops_v2 { 9 } else { 7 };
+        let (op, res_ty) = match self.rng.below(kinds) {
             0 => {
                 let u = self.rng.pick(&[UnaryOp::Neg, UnaryOp::Abs]);
                 (
@@ -555,6 +565,52 @@ impl G<'_> {
                     ty,
                 )
             }
+            7 => {
+                // OPS v2 pow under any policy: the error edge takes a negative
+                // exponent (6) and, under `error`, an overflow (1).
+                let e = self.exponent(ty);
+                let o = self
+                    .rng
+                    .pick(&[Overflow::Wrap, Overflow::Trap, Overflow::Error]);
+                let o = if o == Overflow::Trap && !self.opts.traps {
+                    Overflow::Error
+                } else {
+                    o
+                };
+                let policy = Policy::overflow(o);
+                if !BinaryOp::Pow.can_error(policy, ty) {
+                    // Unsigned wrap/trap cannot fail: a plain instruction.
+                    let r = self.b.binary(BinaryOp::Pow, policy, a, e).unwrap();
+                    self.push(r, ty);
+                    return;
+                }
+                (
+                    InstData::Binary {
+                        op: BinaryOp::Pow,
+                        policy,
+                        args: [a, e],
+                    },
+                    ty,
+                )
+            }
+            8 => {
+                let n = self.shift_amount(ty);
+                let bop = self.rng.pick(&[BinaryOp::Shl, BinaryOp::Shr]);
+                let policy = Policy::shift(Shift::Saturate);
+                if !bop.can_error(policy, ty) {
+                    let r = self.b.binary(bop, policy, a, n).unwrap();
+                    self.push(r, ty);
+                    return;
+                }
+                (
+                    InstData::Binary {
+                        op: bop,
+                        policy,
+                        args: [a, n],
+                    },
+                    ty,
+                )
+            }
             5 => {
                 let mut to = self.rng.pick(&INTS);
                 if to == ty {
@@ -583,6 +639,12 @@ impl G<'_> {
                 )
             }
         };
+        self.emit_check(op, res_ty);
+    }
+
+    /// `check op`: the error edge returns a value depending on the code, or
+    /// rejoins the normal edge with a fallback; the result is pushed.
+    fn emit_check(&mut self, op: InstData, res_ty: Type) {
         let ok = self.b.create_block(&[res_ty]).unwrap();
         let err = self.b.create_block(&[Type::U32]).unwrap();
         self.b
@@ -607,6 +669,128 @@ impl G<'_> {
         self.b.switch_to(ok).unwrap();
         let r = self.b.block_param(ok, 0).unwrap();
         self.push(r, res_ty);
+    }
+
+    /// An exponent for `pow`: small and known, small at run time, or any
+    /// value of `ty` (negative ones included, for the error edge).
+    fn exponent(&mut self, ty: Type) -> Value {
+        match self.rng.below(4) {
+            0 => self.b.iconst(ty, self.rng.below(13) as i128).unwrap(),
+            1 | 2 => {
+                let v = self.value(ty);
+                let k = self.b.iconst(ty, 15).unwrap();
+                self.b.binary(BinaryOp::And, Policy::NONE, v, k).unwrap()
+            }
+            _ => self.value(ty),
+        }
+    }
+
+    /// A shift amount around the width: in range, past it, or anything.
+    fn shift_amount(&mut self, ty: Type) -> Value {
+        let w = ty.int_bits().unwrap();
+        match self.rng.below(3) {
+            0 => self
+                .b
+                .iconst(ty, (self.rng.below(u64::from(w) + 4)) as i128)
+                .unwrap(),
+            _ => self.value(ty),
+        }
+    }
+
+    /// OPS v2 as plain instructions where they cannot fail (unsigned `pow`
+    /// under `wrap` or `trap`, unsigned saturating shifts), as `check`s
+    /// where they can.
+    fn ops_v2(&mut self) {
+        let (a, ty) = self.int_value();
+        let (op, policy, b) = if self.rng.chance(50) {
+            let e = self.exponent(ty);
+            let o = self.overflow();
+            (BinaryOp::Pow, Policy::overflow(o), e)
+        } else {
+            let n = self.shift_amount(ty);
+            let op = self.rng.pick(&[BinaryOp::Shl, BinaryOp::Shr]);
+            (op, Policy::shift(Shift::Saturate), n)
+        };
+        if op.can_error(policy, ty) {
+            self.emit_check(
+                InstData::Binary {
+                    op,
+                    policy,
+                    args: [a, b],
+                },
+                ty,
+            );
+        } else {
+            let r = self.b.binary(op, policy, a, b).unwrap();
+            self.push(r, ty);
+        }
+    }
+
+    /// Float `pow` on bit patterns: an integer value reinterpreted as a
+    /// float, raised to a constant, another reinterpreted value, or itself;
+    /// sometimes through a `select`, memory, or a join's parameter; the
+    /// result reinterpreted back.
+    fn float_pow(&mut self) {
+        let wide = self.rng.chance(60);
+        let (ity, fty) = if wide {
+            (self.rng.pick(&[Type::U64, Type::I64]), Type::F64)
+        } else {
+            (self.rng.pick(&[Type::U32, Type::I32]), Type::F32)
+        };
+        let a = self.value(ity);
+        let fa = self
+            .b
+            .convert(ConvOp::Bitcast, Policy::NONE, a, fty)
+            .unwrap();
+        let fb = match self.rng.below(3) {
+            0 => {
+                let k = self
+                    .rng
+                    .pick(&[0.5, 2.0, -1.0, 3.0, 1.0 / 3.0, 0.0, -0.5, 10.0, 1e10]);
+                if wide {
+                    self.b.f64const(k).unwrap()
+                } else {
+                    self.b.f32const(k as f32).unwrap()
+                }
+            }
+            1 => {
+                let v = self.value(ity);
+                self.b
+                    .convert(ConvOp::Bitcast, Policy::NONE, v, fty)
+                    .unwrap()
+            }
+            _ => fa,
+        };
+        let mut p = self.b.binary(BinaryOp::Pow, Policy::NONE, fa, fb).unwrap();
+        if self.rng.chance(30) {
+            let c = self.cond();
+            p = self.b.select(c, p, fa).unwrap();
+        }
+        if self.rng.chance(25) {
+            if let Some([pa, _, _]) = self.slots {
+                let idx = self.index();
+                let at = self.b.elem_addr(pa, MemType::Scalar(fty), idx).unwrap();
+                let size = if wide { 8 } else { 4 };
+                let _ = self.b.store(p, at, MemFlags::new(size)).unwrap();
+                p = self.b.load(fty, at, MemFlags::new(size)).unwrap();
+            }
+        }
+        if self.rng.chance(25) {
+            // Floats as block parameters on both edges of a diamond.
+            let c = self.cond();
+            let join = self.b.create_block(&[fty]).unwrap();
+            let other = self.b.create_block(&[]).unwrap();
+            self.b.branch(c, join, &[p], other, &[]).unwrap();
+            self.b.switch_to(other).unwrap();
+            self.b.jump(join, &[fa]).unwrap();
+            self.b.switch_to(join).unwrap();
+            p = self.b.block_param(join, 0).unwrap();
+        }
+        let r = self
+            .b
+            .convert(ConvOp::Bitcast, Policy::NONE, p, ity)
+            .unwrap();
+        self.push(r, ity);
     }
 
     fn cond(&mut self) -> Value {

@@ -5,8 +5,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::RegAllocError;
-use super::liveness::{Analysis, phys_uses, writes};
-use super::rewrite::SpillState;
+use super::liveness::Analysis;
+use super::rewrite::{SpillReport, SpillState};
 use crate::mir::cfg::NONE;
 use crate::mir::visit::Access;
 use crate::mir::{Block, Function, Inst, Operand};
@@ -31,20 +31,15 @@ pub(crate) struct Colored {
     pub(crate) spill: Vec<VReg>,
 }
 
-/// Union-find over values joined by copies, ties, and edges.
+/// Union-find over values joined by copies, ties, and edges, with each
+/// class's register in the round being colored.
+#[derive(Clone)]
 struct Affinity {
     parent: Vec<u32>,
     reg: Vec<Option<PReg>>,
 }
 
 impl Affinity {
-    fn new(n: usize) -> Affinity {
-        Affinity {
-            parent: (0..n as u32).collect(),
-            reg: vec![None; n],
-        }
-    }
-
     fn find(&mut self, mut v: u32) -> u32 {
         // Path halving; the walk only climbs, so it ends.
         while let Some(&p) = self.parent.get(v as usize) {
@@ -90,89 +85,135 @@ pub(crate) fn is_remat(f: &Function, inst: Inst) -> bool {
     })
 }
 
-/// Colors `f` given this round's analysis.
-pub(crate) fn color(
-    f: &Function,
-    an: &Analysis<'_>,
-    state: &SpillState,
-) -> Result<Colored, RegAllocError> {
-    let nv = f.vreg_count();
-    let target = f.target();
-    let callee = f.abi().callee_saved();
-    let mut loc = vec![Loc::None; nv];
-    let mut aff = Affinity::new(nv);
-    let mut hint: Vec<Option<PReg>> = vec![None; nv];
-    let mut remat = vec![false; nv];
-    let mut tied_of: Vec<u32> = Vec::new();
+/// What coloring prefers, built once per allocation: the affinity classes
+/// (values joined by copies, ties, and edges), hints toward fixed registers,
+/// and which values are rematerializable. A spill round only adds
+/// temporaries, so [`Affinities::update`] looks at the instructions that use
+/// them and nothing else.
+pub(crate) struct Affinities {
+    classes: Affinity,
+    hint: Vec<Option<PReg>>,
+    remat: Vec<bool>,
+}
 
-    // Affinities and hints, from copies, ties, and edges.
-    for &b in &an.cfg.rpo {
-        let block = Block::from_index(b as usize);
-        for &inst in f.insts(block) {
-            let Some(desc) = f.opcode(inst).and_then(|o| target.inst(o)) else {
-                continue;
+impl Affinities {
+    pub(crate) fn new(f: &Function, an: &Analysis<'_>) -> Affinities {
+        let nv = f.vreg_count();
+        let mut a = Affinities {
+            classes: Affinity {
+                parent: (0..nv as u32).collect(),
+                reg: Vec::new(),
+            },
+            hint: vec![None; nv],
+            remat: vec![false; nv],
+        };
+        for &b in &an.cfg.rpo {
+            for &inst in f.insts(Block::from_index(b as usize)) {
+                a.add(f, inst);
+            }
+        }
+        a
+    }
+
+    /// Takes in a spill round's new instructions and the instructions that
+    /// now read a temporary.
+    pub(crate) fn update(&mut self, f: &Function, report: &SpillReport) {
+        let nv = f.vreg_count();
+        let old = self.classes.parent.len() as u32;
+        self.classes.parent.extend(old..nv as u32);
+        self.hint.resize(nv, None);
+        self.remat.resize(nv, false);
+        for &(_, def, _) in &report.temps {
+            self.add(f, def);
+        }
+        for &inst in &report.anchors {
+            self.add(f, inst);
+        }
+    }
+
+    /// Records the affinities and hints `inst` creates.
+    fn add(&mut self, f: &Function, inst: Inst) {
+        let Some(desc) = f.opcode(inst).and_then(|o| f.target().inst(o)) else {
+            return;
+        };
+        let ops = f.operands(inst);
+        let (aff, hint) = (&mut self.classes, &mut self.hint);
+        let mut pair = |d: Operand, s: Operand| {
+            let (Some(dr), Some(sr)) = (d.reg(), s.reg()) else {
+                return;
             };
-            let ops = f.operands(inst);
-            let pair = |aff: &mut Affinity,
-                        hint: &mut Vec<Option<PReg>>,
-                        d: Operand,
-                        s: Operand| {
-                let (Some(dr), Some(sr)) = (d.reg(), s.reg()) else {
-                    return;
-                };
-                match (dr.as_virt(), sr.as_virt(), dr.as_phys(), sr.as_phys()) {
-                    (Some(dv), Some(sv), _, _) => aff.union(dv.index() as u32, sv.index() as u32),
-                    (Some(dv), None, _, Some(sp)) => {
-                        if let Some(h) = hint.get_mut(dv.index()) {
-                            *h = Some(sp);
-                        }
-                    }
-                    (None, Some(sv), Some(dp), _) => {
-                        if let Some(h) = hint.get_mut(sv.index()) {
-                            *h = Some(dp);
-                        }
-                    }
-                    _ => {}
-                }
-            };
-            match desc.kind() {
-                InstKind::Copy => {
-                    if let (Some(&d), Some(&s)) = (ops.first(), ops.get(1)) {
-                        pair(&mut aff, &mut hint, d, s);
+            match (dr.as_virt(), sr.as_virt(), dr.as_phys(), sr.as_phys()) {
+                (Some(dv), Some(sv), _, _) => aff.union(dv.index() as u32, sv.index() as u32),
+                (Some(dv), None, _, Some(sp)) => {
+                    if let Some(h) = hint.get_mut(dv.index()) {
+                        *h = Some(sp);
                     }
                 }
-                InstKind::ParallelCopy => {
-                    let n = ops.len() / 2;
-                    for k in 0..n {
-                        pair(&mut aff, &mut hint, ops[k], ops[n + k]);
+                (None, Some(sv), Some(dp), _) => {
+                    if let Some(h) = hint.get_mut(sv.index()) {
+                        *h = Some(dp);
                     }
                 }
-                _ => {
-                    for (k, rule) in desc.operands().iter().enumerate() {
-                        if let OperandRule::Tied(d) = *rule {
-                            if let (Some(&dop), Some(&sop)) = (ops.get(usize::from(d)), ops.get(k))
-                            {
-                                pair(&mut aff, &mut hint, dop, sop);
-                            }
+                _ => {}
+            }
+        };
+        match desc.kind() {
+            InstKind::Copy => {
+                if let (Some(&d), Some(&s)) = (ops.first(), ops.get(1)) {
+                    pair(d, s);
+                }
+            }
+            InstKind::ParallelCopy => {
+                let n = ops.len() / 2;
+                for k in 0..n {
+                    pair(ops[k], ops[n + k]);
+                }
+            }
+            _ => {
+                for (k, rule) in desc.operands().iter().enumerate() {
+                    if let OperandRule::Tied(d) = *rule {
+                        if let (Some(&dop), Some(&sop)) = (ops.get(usize::from(d)), ops.get(k)) {
+                            pair(dop, sop);
                         }
                     }
                 }
             }
-            for op in ops {
-                if let Operand::Block(call) = op {
-                    let params = f.params(call.block());
-                    for (p, a) in params.iter().zip(f.args(*call)) {
-                        pair(&mut aff, &mut hint, *p, *a);
-                    }
+        }
+        for op in ops {
+            if let Operand::Block(call) = op {
+                let params = f.params(call.block());
+                for (p, a) in params.iter().zip(f.args(*call)) {
+                    pair(*p, *a);
                 }
             }
-            if is_remat(f, inst) {
-                if let Some(v) = ops.first().and_then(Operand::reg).and_then(Reg::as_virt) {
-                    remat[v.index()] = true;
+        }
+        if is_remat(f, inst) {
+            if let Some(v) = ops.first().and_then(Operand::reg).and_then(Reg::as_virt) {
+                if let Some(r) = self.remat.get_mut(v.index()) {
+                    *r = true;
                 }
             }
         }
     }
+}
+
+/// Colors `f` given the analysis and the affinities.
+pub(crate) fn color(
+    f: &Function,
+    an: &Analysis<'_>,
+    prefs: &Affinities,
+    state: &SpillState,
+) -> Result<Colored, RegAllocError> {
+    let nv = f.vreg_count();
+    let callee = f.abi().callee_saved();
+    let mut loc = vec![Loc::None; nv];
+    let mut aff = Affinity {
+        parent: prefs.classes.parent.clone(),
+        reg: vec![None; nv],
+    };
+    let hint = &prefs.hint;
+    let remat = &prefs.remat;
+    let mut tied_of: Vec<u32> = Vec::new();
 
     let weight = |v: u32| -> u64 {
         let i = v as usize;
@@ -216,7 +257,7 @@ pub(crate) fn color(
             let vi = v.index() as u32;
             let class = super::class_of(f, v);
             let allowed = allowed_regs(f, an, class, vi).difference(entry_phys);
-            match pick(f, &owner, allowed, &mut aff, &hint, vi, None, callee) {
+            match pick(f, &owner, allowed, &mut aff, hint, vi, None, callee) {
                 Some(r) => {
                     loc[vi as usize] = Loc::Reg(r);
                     owner[r.index()] = vi;
@@ -243,7 +284,7 @@ pub(crate) fn color(
                 &mut loc,
                 &mut owner,
                 &mut aff,
-                &hint,
+                hint,
                 &weight,
                 &mut spill,
                 &mut use_regs,
@@ -423,7 +464,8 @@ fn color_inst(
     }
     let early_clobber = desc.kind() == InstKind::Switch;
     let read_regs: RegSet = use_regs.iter().filter_map(|&(_, p)| p).collect();
-    let phys_read = phys_uses(f, inst);
+    // Restricted to the tracked registers, which is all `allowed` can hold.
+    let phys_read = an.reads(inst);
 
     // Last uses free their registers before the definitions are placed.
     let killed = an.kills(inst);
@@ -435,7 +477,7 @@ fn color_inst(
         }
     }
 
-    let w = writes(f, inst);
+    let w = an.writes(inst);
     let after = an
         .phys_after
         .get(inst.index())

@@ -4,7 +4,7 @@
 use super::entity::Inst;
 use super::function::Function;
 use super::operand::{Mem, Operand};
-use crate::regs::Reg;
+use crate::regs::{Reg, VReg};
 use crate::target::{InstKind, OperandRule};
 
 /// Where a register sits inside a function's operand pools.
@@ -101,6 +101,57 @@ impl Function {
                 _ => {}
             }
         }
+    }
+
+    /// Replaces every virtual register `inst` names (register operands,
+    /// memory-operand registers, branch arguments) with `map(v)`, in place:
+    /// the final substitution after register allocation, without collecting
+    /// positions first.
+    pub(crate) fn map_vregs<E>(
+        &mut self,
+        inst: Inst,
+        mut map: impl FnMut(VReg) -> Result<Reg, E>,
+    ) -> Result<(), E> {
+        let Some(data) = self.insts.get(inst.index()) else {
+            return Ok(());
+        };
+        let (start, n) = (data.ops as usize, data.nops as usize);
+        let Function { operands, args, .. } = self;
+        let Some(ops) = operands.get_mut(start..start + n) else {
+            return Ok(());
+        };
+        for op in ops.iter_mut() {
+            match op {
+                Operand::Reg(r) => {
+                    if let Some(v) = r.as_virt() {
+                        *r = map(v)?;
+                    }
+                }
+                Operand::Mem(m) => {
+                    if let Some(v) = m.base_reg().and_then(Reg::as_virt) {
+                        *m = m.with_base(map(v)?);
+                    }
+                    if let Some((x, s)) = m.index_reg() {
+                        if let Some(v) = x.as_virt() {
+                            *m = m.with_index(map(v)?, s);
+                        }
+                    }
+                }
+                Operand::Block(call) => {
+                    if let Some(list) = args.get_mut(call.range()) {
+                        for a in list {
+                            if let Operand::Reg(r) = a {
+                                if let Some(v) = r.as_virt() {
+                                    *r = map(v)?;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Replaces the register at `pos`.

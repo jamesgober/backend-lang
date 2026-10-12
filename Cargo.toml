@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "backend-lang"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -56,7 +56,7 @@ std = ["isa-lang/std", "ir-lang/std"]
 isa-lang = { version = "0.2", default-features = false }
 # The SSA IR instruction selection reads (first-party, from crates.io). The
 # 2.0 line is a pre-release, so it is pinned exactly.
-ir-lang = { version = "=2.0.0-alpha.1", default-features = false }
+ir-lang = { version = "=2.0.0-alpha.3", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -68,7 +68,7 @@ proptest  = "1"
 object-lang = "0.2"
 # Test-only: ir-lang's reference interpreter is the oracle of the
 # differential tests and benchmarks.
-ir-lang = { version = "=2.0.0-alpha.1", features = ["interp"] }
+ir-lang = { version = "=2.0.0-alpha.3", features = ["interp"] }
 
 
 # BENCHMARKS

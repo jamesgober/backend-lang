@@ -8,11 +8,15 @@
 //! frame layout, and a parallel-move resolver. No Cranelift, no LLVM, no
 //! system assembler.
 //!
-//! This release (0.3) compiles the integer, control-flow, memory, call, and
-//! checked-arithmetic subset of ir-lang. Floating point waits on isa-lang's
-//! SSE forms, AArch64 on its AArch64 forms, and unwind tables on object
-//! files that carry them; each is refused with an error that says so, never
-//! miscompiled.
+//! This release (0.4) compiles the integer, control-flow, memory, call, and
+//! checked-arithmetic subset of ir-lang 2.0.0-alpha.3, OPS v2 included
+//! (integer and float `pow`, `shift = saturate`), and SSA built by ir-lang's
+//! variables API and statepoint insertion. Floats are carried as bit
+//! patterns in general-purpose registers (constants, `bitcast`, loads,
+//! stores, `select`, edges), and float `pow` calls the runtime's `ls_pow`;
+//! other float arithmetic waits on isa-lang's SSE forms, AArch64 on its
+//! AArch64 forms, and unwind tables on object files that carry them. Each is
+//! refused with an error that says so, never miscompiled.
 //!
 //! ## Quick start
 //!
@@ -98,8 +102,10 @@
 //! ## Guarantees
 //!
 //! - **Compiled code computes what the IR says.** Random ir-lang programs
-//!   (every integer operation under every policy, error edges, loops,
-//!   switches, memory, calls, tail calls) are compiled and run against
+//!   (every integer operation under every policy, OPS v2's `pow` and
+//!   saturating shifts, float `pow`, error edges, loops, switches, memory,
+//!   calls, tail calls), programs built through ir-lang's variables API, and
+//!   programs whose statepoints ir-lang inserted are compiled and run against
 //!   ir-lang's reference interpreter, in an x86-64 interpreter under SysV and
 //!   Win64 and natively on x86-64 Linux and Windows.
 //! - **Stack maps are exact.** At every safepoint the recorded root slots are
@@ -117,7 +123,8 @@
 //!   every walk a loop, every fallible path a `Result`. Passes are linear in
 //!   the function (one sort here and there) except liveness, whose cost is
 //!   the size of the live sets and has a budget
-//!   ([`regalloc::Options::live_budget`]).
+//!   ([`regalloc::Options::live_budget`]), checked once: spill rounds update
+//!   the live sets incrementally and only shrink them.
 //!
 //! ## Features
 //!

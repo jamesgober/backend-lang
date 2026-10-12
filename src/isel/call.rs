@@ -229,6 +229,42 @@ impl Sel<'_> {
         Ok(())
     }
 
+    /// Float `pow` (OPS v2): a call to the runtime's `ls_pow` routine for the
+    /// type ([`Options::pow_f64_symbol`](crate::Options::pow_f64_symbol) or
+    /// [`Options::pow_f32_symbol`](crate::Options::pow_f32_symbol)) under the
+    /// platform's C convention, with the operands' bit patterns in the first
+    /// two integer argument registers and the result's bit pattern in the
+    /// first integer return register. The routine is ir-lang's `ls_pow` (or a
+    /// bit-identical port), so every tier computes the same bits; it is not a
+    /// safepoint and never collects.
+    pub(crate) fn float_pow(&mut self, args: [Value; 2]) -> Result<Reg> {
+        let ty = self.ty_any(args[0])?;
+        let name = if ty == Type::F32 {
+            self.opts.pow_f32_symbol
+        } else {
+            self.opts.pow_f64_symbol
+        };
+        let abi = self.opts.abi;
+        let ints = abi.args().int();
+        let (Some(&a0), Some(&a1)) = (ints.first(), ints.get(1)) else {
+            return Err(MirError::Limit.into());
+        };
+        let ret = abi.rets().int().first().copied().ok_or(MirError::Limit)?;
+        let x = self.operand(args[0])?;
+        let y = self.operand(args[1])?;
+        let _ = self.emit(op::PCOPY, &[a0.into(), a1.into(), x, y])?;
+        let sym = self.symbol(name)?;
+        let _ = self.emit_with(
+            op::CALL,
+            &[sym.into()],
+            Effects::new()
+                .uses(&[a0, a1])
+                .defs(&[ret])
+                .clobbers(abi.call_clobbers()),
+        )?;
+        self.copy_to_new(ret.into())
+    }
+
     /// `ret v...`: the values into the return registers, then the epilogue.
     pub(crate) fn ret(&mut self, values: &[Value]) -> Result<()> {
         let sig = self

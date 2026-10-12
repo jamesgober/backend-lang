@@ -144,6 +144,15 @@ impl Mem {
         }
     }
 
+    /// The same reference with base register `base`.
+    #[inline]
+    pub(crate) fn with_base(self, base: Reg) -> Mem {
+        Mem {
+            base: reg_bits(base),
+            ..self
+        }
+    }
+
     /// The same reference with displacement `disp`.
     ///
     /// # Examples

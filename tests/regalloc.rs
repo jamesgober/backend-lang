@@ -763,7 +763,13 @@ proptest! {
         regs in 1usize..6,
     ) {
         let mut f = hostile(&ops, blocks, regs);
-        if regalloc::allocate(&mut f).is_ok() {
+        // The allocator checks its precondition in its own first walk; it
+        // must reject exactly what `verify_ssa` rejects, with the same error.
+        let pre = f.verify_ssa();
+        let r = regalloc::allocate(&mut f);
+        if let Err(e) = pre {
+            prop_assert_eq!(r.map(|_| ()), Err(backend_lang::regalloc::RegAllocError::Mir(e)));
+        } else if r.is_ok() {
             let mut e = x86_64::Emitter::new();
             let _ = e.function(&f);
         }

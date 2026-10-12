@@ -712,6 +712,372 @@ fn test_call_sites_without_safepoints_have_no_stack_map() {
     assert!(sites[0].gc_slots().is_empty());
 }
 
+// ------------------------------------------- statepoints by ir-lang itself
+
+/// [`gc_program`]'s shape built the way a front end lowers locals: every
+/// reference and the accumulator are variables (ir-lang's variables API
+/// places the loop's block parameters), and no call carries a GC list.
+/// `insert_statepoints` then adds the lists, relocates the references live
+/// across each safepoint, and repairs SSA with block parameters where the
+/// relocated versions meet.
+fn gc_program_vars(seed: u64) -> (GcProgram, ir_lang::StatepointStats) {
+    let mut rng = Rng::new(seed);
+    let mut m = Module::new("gcv");
+    let alloc = m
+        .declare_function(
+            "alloc",
+            &Signature::new(&[Type::U64], &[Type::Ref]),
+            Linkage::Import,
+        )
+        .unwrap();
+    m.set_attrs(alloc, Attrs::NOGC).unwrap();
+    let collect = m
+        .declare_function("collect", &Signature::new(&[], &[]), Linkage::Import)
+        .unwrap();
+    // touch(r, k): collect with r live, then r.field0 += k; returns the old
+    // field. No GC list: insert_statepoints relocates r.
+    let touch = m
+        .declare_function(
+            "touch",
+            &Signature::new(&[Type::Ref, Type::I64], &[Type::I64]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut stats = ir_lang::StatepointStats::default();
+    {
+        let mut b = m.build(touch).unwrap();
+        let (r, k) = (b.param(0).unwrap(), b.param(1).unwrap());
+        let _ = b.call(Call::direct(collect, &[])).unwrap();
+        let p = b
+            .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+            .unwrap();
+        let old = b.load(Type::I64, p, MemFlags::new(8)).unwrap();
+        let new = b.add(old, k, Overflow::Wrap).unwrap();
+        let _ = b.store(new, p, MemFlags::new(8)).unwrap();
+        b.ret(&[old]).unwrap();
+        let s = b.insert_statepoints().unwrap();
+        stats.safepoints += s.safepoints;
+        stats.relocations += s.relocations;
+        stats.params += s.params;
+    }
+    let n = 1 + rng.below(6) as usize;
+    let main = m
+        .declare_function(
+            "main",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(main).unwrap();
+    let seed_v = b.param(0).unwrap();
+    let size = b.iconst(Type::U64, (8 * FIELDS) as i128).unwrap();
+    let refs: Vec<ir_lang::Variable> = (0..n).map(|_| b.declare_var(Type::Ref).unwrap()).collect();
+    let acc = b.declare_var(Type::I64).unwrap();
+    let i = b.declare_var(Type::I32).unwrap();
+    for (k, &var) in refs.iter().enumerate() {
+        let c = b.call(Call::direct(alloc, &[size])).unwrap();
+        let r = b.results(c).first().unwrap();
+        let p = b
+            .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+            .unwrap();
+        let kk = b.iconst(Type::I64, (k as i128 + 1) * 1000).unwrap();
+        let v = b.add(seed_v, kk, Overflow::Wrap).unwrap();
+        let _ = b.store(v, p, MemFlags::new(8)).unwrap();
+        let eight = b.iconst(Type::U64, 8).unwrap();
+        let p1 = b.ptr_offset(p, eight).unwrap();
+        let _ = b.store(kk, p1, MemFlags::new(8)).unwrap();
+        b.def_var(var, r).unwrap();
+    }
+    let zero = b.iconst(Type::I64, 0).unwrap();
+    b.def_var(acc, zero).unwrap();
+    let zero32 = b.iconst(Type::I32, 0).unwrap();
+    b.def_var(i, zero32).unwrap();
+    let (head, body, exit) = (
+        b.create_block(&[]).unwrap(),
+        b.create_block(&[]).unwrap(),
+        b.create_block(&[]).unwrap(),
+    );
+    b.jump(head, &[]).unwrap();
+    b.switch_to(head).unwrap();
+    let iv = b.use_var(i).unwrap();
+    let trips = b.iconst(Type::I32, 1 + rng.below(5) as i128).unwrap();
+    let more = b.compare(CmpOp::Lt, iv, trips).unwrap();
+    b.branch(more, body, &[], exit, &[]).unwrap();
+    b.switch_to(body).unwrap();
+    b.seal_block(body).unwrap();
+    for _ in 0..1 + rng.below(6) {
+        match rng.below(5) {
+            0 => {
+                let _ = b.call(Call::direct(collect, &[])).unwrap();
+            }
+            1 => {
+                let j = rng.below(n as u64) as usize;
+                let r = b.use_var(refs[j]).unwrap();
+                let k = b.iconst(Type::I64, rng.below(100) as i128).unwrap();
+                let c = b.call(Call::direct(touch, &[r, k])).unwrap();
+                let res = b.results(c).first().unwrap();
+                let a = b.use_var(acc).unwrap();
+                let a2 = b.add(a, res, Overflow::Wrap).unwrap();
+                b.def_var(acc, a2).unwrap();
+            }
+            2 => {
+                // Swap two references: their variables carry other objects
+                // around the loop from here on.
+                let (j, k) = (rng.below(n as u64) as usize, rng.below(n as u64) as usize);
+                let (rj, rk) = (b.use_var(refs[j]).unwrap(), b.use_var(refs[k]).unwrap());
+                b.def_var(refs[j], rk).unwrap();
+                b.def_var(refs[k], rj).unwrap();
+            }
+            3 => {
+                let j = rng.below(n as u64) as usize;
+                let r = b.use_var(refs[j]).unwrap();
+                let p = b
+                    .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+                    .unwrap();
+                let off = b
+                    .iconst(Type::U64, (8 * rng.below(FIELDS)) as i128)
+                    .unwrap();
+                let a = b.ptr_offset(p, off).unwrap();
+                let v = b.load(Type::I64, a, MemFlags::new(8)).unwrap();
+                let x = b.use_var(acc).unwrap();
+                let x2 = b.binary(BinaryOp::Xor, Policy::NONE, x, v).unwrap();
+                b.def_var(acc, x2).unwrap();
+            }
+            _ => {
+                let j = rng.below(n as u64) as usize;
+                let r = b.use_var(refs[j]).unwrap();
+                let p = b
+                    .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+                    .unwrap();
+                let x = b.use_var(acc).unwrap();
+                let _ = b.store(x, p, MemFlags::new(8)).unwrap();
+            }
+        }
+    }
+    let iv = b.use_var(i).unwrap();
+    let one = b.iconst(Type::I32, 1).unwrap();
+    let i2 = b.add(iv, one, Overflow::Wrap).unwrap();
+    b.def_var(i, i2).unwrap();
+    b.jump(head, &[]).unwrap();
+    b.seal_block(head).unwrap();
+    b.switch_to(exit).unwrap();
+    b.seal_block(exit).unwrap();
+    let mut total = b.use_var(acc).unwrap();
+    for (k, &var) in refs.iter().enumerate() {
+        let r = b.use_var(var).unwrap();
+        let p = b
+            .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+            .unwrap();
+        for f in 0..FIELDS {
+            let off = b.iconst(Type::U64, (8 * f) as i128).unwrap();
+            let a = b.ptr_offset(p, off).unwrap();
+            let v = b.load(Type::I64, a, MemFlags::new(8)).unwrap();
+            let rot = b
+                .iconst(Type::I64, (k as i128 * 3 + f as i128) & 63)
+                .unwrap();
+            let v = b
+                .binary(BinaryOp::Shl, Policy::shift(ir_lang::Shift::Mask), v, rot)
+                .unwrap();
+            total = b.add(total, v, Overflow::Wrap).unwrap();
+        }
+    }
+    b.ret(&[total]).unwrap();
+    b.seal_all_blocks().unwrap();
+    let s = b.insert_statepoints().unwrap();
+    stats.safepoints += s.safepoints;
+    stats.relocations += s.relocations;
+    stats.params += s.params;
+    (GcProgram { module: m, main }, stats)
+}
+
+#[test]
+fn test_statepoints_inserted_by_ir_lang_survive_a_moving_collector() {
+    let (mut relocations, mut params, mut collections) = (0, 0, 0);
+    for seed in 0..120u64 {
+        let (p, stats) = gc_program_vars(seed);
+        p.module
+            .validate()
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}\n{}", p.module));
+        relocations += stats.relocations;
+        params += stats.params;
+        let arg = (seed as i64).wrapping_mul(6007);
+        // The interpreter rejects any reference used after a safepoint
+        // without being relocated through its list.
+        let want = match reference(&p.module, p.main, &[Val::i64(arg)]) {
+            Outcome::Return(v) => v[0].bits(),
+            other => panic!("seed {seed}: {other:?}"),
+        };
+        for conv in [Conv::SysV, Conv::Win64] {
+            let opts = options(conv).with_frame_pointer(seed % 2 == 0);
+            let c = backend_lang::compile(&p.module, &opts).unwrap();
+            let (stop, rax, heap) = native(&c, conv, "main", &[arg as u64], seed);
+            assert_eq!(
+                stop,
+                Ok(Stop::Returned),
+                "seed {seed} {conv:?}\n{}",
+                p.module
+            );
+            assert_eq!(rax, want, "seed {seed} {conv:?}\n{}", p.module);
+            collections += heap.collections;
+        }
+        on_hardware(&p, arg, want, seed);
+    }
+    assert!(
+        relocations > 500 && params > 50 && collections > 200,
+        "{relocations} relocations, {params} parameters, {collections} collections"
+    );
+}
+
+/// [`invoke_module`]'s `inner` without GC lists: `insert_statepoints` adds
+/// the reference to the invoke's list and passes the relocated version to
+/// both successors as a result (`resN`).
+fn invoke_module_auto(cleanup: bool) -> (Module, FuncId) {
+    let mut m = Module::new("eh_auto");
+    let thrower = m
+        .declare_function(
+            "thrower",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Import,
+        )
+        .unwrap();
+    let alloc = m
+        .declare_function(
+            "alloc",
+            &Signature::new(&[Type::U64], &[Type::Ref]),
+            Linkage::Import,
+        )
+        .unwrap();
+    m.set_attrs(alloc, Attrs::NOGC).unwrap();
+    let f = m
+        .declare_function(
+            "outer",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(f).unwrap();
+    let x = b.param(0).unwrap();
+    let size = b.iconst(Type::U64, 8).unwrap();
+    let c = b.call(Call::direct(alloc, &[size])).unwrap();
+    let r = b.results(c).first().unwrap();
+    let p = b
+        .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+        .unwrap();
+    let k = b.iconst(Type::I64, 1000).unwrap();
+    let _ = b.store(k, p, MemFlags::new(8)).unwrap();
+    let ok = b.create_block(&[Type::I64]).unwrap();
+    let pad = b.create_block(&[Type::Ptr]).unwrap();
+    b.invoke(
+        Call::direct(thrower, &[x]),
+        BlockCall::with_args(ok, &[BlockArg::Result(0)]),
+        BlockCall::with_args(pad, &[BlockArg::Exception]),
+    )
+    .unwrap();
+    b.switch_to(ok).unwrap();
+    let v = b.block_param(ok, 0).unwrap();
+    let p = b
+        .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+        .unwrap();
+    let field = b.load(Type::I64, p, MemFlags::new(8)).unwrap();
+    let s = b.add(v, field, Overflow::Wrap).unwrap();
+    b.ret(&[s]).unwrap();
+    b.switch_to(pad).unwrap();
+    let exn = b.block_param(pad, 0).unwrap();
+    let p = b
+        .convert(ConvOp::RefToPtr, Policy::NONE, r, Type::Ptr)
+        .unwrap();
+    let e = b
+        .convert(ConvOp::PtrToInt, Policy::NONE, exn, Type::I64)
+        .unwrap();
+    let field = b.load(Type::I64, p, MemFlags::new(8)).unwrap();
+    if cleanup {
+        let _ = b.store(e, p, MemFlags::new(8)).unwrap();
+        b.resume(exn).unwrap();
+    } else {
+        let s = b.add(e, field, Overflow::Wrap).unwrap();
+        b.ret(&[s]).unwrap();
+    }
+    let stats = b.insert_statepoints().unwrap();
+    assert_eq!((stats.safepoints, stats.relocations), (1, 1));
+    drop(b);
+    (m, f)
+}
+
+#[test]
+fn test_inserted_statepoints_on_invokes_reach_both_edges() {
+    for cleanup in [false, true] {
+        let (m, outer) = invoke_module_auto(cleanup);
+        m.validate().unwrap_or_else(|e| panic!("{e}\n{m}"));
+        for x in [0u64, 1, 2, 7, 40, 41] {
+            let want = reference(&m, outer, &[Val::i64(x as i64)]);
+            for conv in [Conv::SysV, Conv::Win64] {
+                for fp in [true, false] {
+                    let c =
+                        backend_lang::compile(&m, &options(conv).with_frame_pointer(fp)).unwrap();
+                    let (stop, rax, _) = native(&c, conv, "outer", &[x], x);
+                    match &want {
+                        Outcome::Return(v) => {
+                            assert_eq!(stop, Ok(Stop::Returned), "x {x} {conv:?}");
+                            assert_eq!(rax, v[0].bits(), "x {x} cleanup {cleanup} {conv:?}");
+                        }
+                        Outcome::Unwind(p) => {
+                            assert_eq!(stop, Ok(Stop::Unwound(p.bits())), "x {x} {conv:?}")
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The statepoint programs on the processor: `alloc` from a native arena,
+/// `collect` a no-op (a non-moving collector), so the root-slot stores and
+/// reloads at every safepoint run on real hardware.
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+fn on_hardware(p: &GcProgram, arg: i64, want: u64, seed: u64) {
+    use common::native::{Native, Ran};
+
+    fn bump(size: u64) -> u64 {
+        // Leaked: a test process allocates a few kilobytes in all.
+        let words = vec![0u64; (size as usize).div_ceil(8).max(1)].into_boxed_slice();
+        Box::leak(words).as_mut_ptr() as u64
+    }
+    extern "sysv64" fn alloc_sysv(size: u64) -> u64 {
+        bump(size)
+    }
+    extern "win64" fn alloc_win64(size: u64) -> u64 {
+        bump(size)
+    }
+    extern "sysv64" fn collect_sysv() {}
+    extern "win64" fn collect_win64() {}
+
+    let conv = if cfg!(windows) {
+        Conv::Win64
+    } else {
+        Conv::SysV
+    };
+    let (alloc, collect) = match conv {
+        Conv::SysV => (
+            alloc_sysv as extern "sysv64" fn(u64) -> u64 as usize as u64,
+            collect_sysv as extern "sysv64" fn() as usize as u64,
+        ),
+        Conv::Win64 => (
+            alloc_win64 as extern "win64" fn(u64) -> u64 as usize as u64,
+            collect_win64 as extern "win64" fn() as usize as u64,
+        ),
+    };
+    let c = backend_lang::compile(&p.module, &Options::host()).unwrap();
+    let n = Native::load_with(&c, conv, &[("alloc", alloc), ("collect", collect)]).unwrap();
+    match n.call("main", &[arg as u64]).unwrap() {
+        Ran::Returned(r, _) => assert_eq!(r, want, "native seed {seed}\n{}", p.module),
+        other => panic!("native seed {seed}: {other:?}"),
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
+fn on_hardware(_: &GcProgram, _: i64, _: u64, _: u64) {}
+
 #[allow(dead_code, reason = "keeps the value helpers in scope")]
 fn _anchor(v: Value) -> Value {
     v

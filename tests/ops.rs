@@ -69,6 +69,18 @@ fn module(
     res_ty: Type,
     checked: bool,
 ) -> (Module, FuncId) {
+    module_k(data, a_ty, res_ty, checked, None)
+}
+
+/// [`module`], with the right operand the constant `k` (raw bits) when
+/// given (the second parameter is then unused).
+fn module_k(
+    data: impl Fn(ir_lang::Value, ir_lang::Value) -> InstData,
+    a_ty: Type,
+    res_ty: Type,
+    checked: bool,
+    k: Option<u64>,
+) -> (Module, FuncId) {
     let mut m = Module::new("ops");
     let f = m
         .declare_function(
@@ -79,6 +91,10 @@ fn module(
         .unwrap();
     let mut b = m.build(f).unwrap();
     let (x, y) = (b.param(0).unwrap(), b.param(1).unwrap());
+    let y = match k {
+        Some(k) => b.iconst(a_ty, common::irgen::as_i128(a_ty, k)).unwrap(),
+        None => y,
+    };
     let widen = |b: &mut ir_lang::Builder<'_>, v, ty: Type| {
         if ty == Type::U64 {
             v
@@ -236,6 +252,12 @@ fn binary_policies(op: BinaryOp) -> Vec<(Policy, bool)> {
         BinaryOp::Shl | BinaryOp::Shr => vec![
             (Policy::shift(Shift::Mask), false),
             (Policy::shift(Shift::Error), true),
+            (Policy::shift(Shift::Saturate), false),
+        ],
+        BinaryOp::Pow => vec![
+            (Policy::overflow(O::Wrap), false),
+            (Policy::overflow(O::Trap), false),
+            (Policy::overflow(O::Error), true),
         ],
         _ => vec![(Policy::NONE, false)],
     }
@@ -261,8 +283,13 @@ fn test_every_binary_operation_under_every_policy() {
             BinaryOp::Shr,
             BinaryOp::Min,
             BinaryOp::Max,
+            BinaryOp::Pow,
         ] {
-            for (policy, checked) in binary_policies(op) {
+            for (policy, _) in binary_policies(op) {
+                // OPS v2: a signed `pow` (negative exponent) and a signed
+                // saturating shift (negative amount) can fail under every
+                // policy, so they are `check`s; ir-lang says which.
+                let checked = op.can_error(policy, ty);
                 let (m, f) = module(
                     |x, y| InstData::Binary {
                         op,
@@ -279,8 +306,8 @@ fn test_every_binary_operation_under_every_policy() {
         }
     }
     // 8 types x (and/or/xor/min/max + add/sub/mul x 3 + div/floor_div x 6
-    // + rem/floor_mod x 2 + shl/shr x 2) = 8 x 34.
-    assert_eq!(cases.len(), 272);
+    // + rem/floor_mod x 2 + shl/shr x 3 + pow x 3) = 8 x 39.
+    assert_eq!(cases.len(), 312);
     run_native(&cases, &tys);
 }
 
@@ -434,4 +461,245 @@ fn test_every_conversion_under_every_policy() {
         assert_eq!(ok, !(0xD800..=0xDFFF).contains(&v) && v <= 0x10_FFFF);
     }
     run_native(&cases, &tys);
+}
+
+#[test]
+fn test_pow_and_saturating_shifts_by_constants() {
+    // Known exponents unroll and known shift amounts fold: every edge value
+    // as the constant, the other operand over the edge values.
+    let mut cases = Vec::new();
+    let mut tys = Vec::new();
+    for ty in INTS {
+        let mut ops: Vec<(BinaryOp, Policy)> = vec![
+            (BinaryOp::Pow, Policy::overflow(Overflow::Wrap)),
+            (BinaryOp::Pow, Policy::overflow(Overflow::Trap)),
+            (BinaryOp::Pow, Policy::overflow(Overflow::Error)),
+        ];
+        for op in [BinaryOp::Shl, BinaryOp::Shr] {
+            ops.push((op, Policy::shift(Shift::Saturate)));
+        }
+        let mut konsts = edges(ty);
+        konsts.extend([5, 15, 31, 33, 63, 64, 65]);
+        let w = ty.int_bits().unwrap();
+        let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+        for k in &mut konsts {
+            *k &= mask;
+        }
+        konsts.sort_unstable();
+        konsts.dedup();
+        for (op, policy) in ops {
+            let checked = op.can_error(policy, ty);
+            for &k in &konsts {
+                let (m, f) = module_k(
+                    |x, y| InstData::Binary {
+                        op,
+                        policy,
+                        args: [x, y],
+                    },
+                    ty,
+                    ty,
+                    checked,
+                    Some(k),
+                );
+                compare(
+                    &m,
+                    f,
+                    ty,
+                    &format!("{ty} {op} {policy} by {k:#x}"),
+                    &mut cases,
+                );
+                tys.push(ty);
+            }
+        }
+    }
+    run_native(&cases, &tys);
+}
+
+/// Float values that exercise `ls_pow`: signed zeros, infinities, NaNs,
+/// subnormals, integers (odd and even), halves, and ordinary values.
+fn float_edges() -> Vec<f64> {
+    vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        0.5,
+        -0.5,
+        3.0,
+        -3.0,
+        10.0,
+        1.0 / 3.0,
+        23.0,
+        5.0,
+        0.1,
+        1e300,
+        -1e300,
+        1e-300,
+        f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0xFFF8_0000_0000_0001),
+        127.0,
+        128.5,
+        -1074.0,
+        1024.0,
+        std::f64::consts::E,
+    ]
+}
+
+/// `f(x, y) = bits(pow(from_bits(x), from_bits(y)))` for `ty` (`f64` over
+/// `u64`, `f32` over `u32`); with `const_y`, the exponent is a float
+/// constant, so its bit pattern travels as an immediate.
+fn float_pow_module(ty: Type, const_y: Option<u64>) -> (Module, FuncId) {
+    let bits_ty = if ty == Type::F64 {
+        Type::U64
+    } else {
+        Type::U32
+    };
+    let mut m = Module::new("fpow");
+    let f = m
+        .declare_function(
+            "f",
+            &Signature::new(&[bits_ty, bits_ty], &[bits_ty]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(f).unwrap();
+    let (x, y) = (b.param(0).unwrap(), b.param(1).unwrap());
+    let fx = b.convert(ConvOp::Bitcast, Policy::NONE, x, ty).unwrap();
+    let fy = match const_y {
+        Some(k) if ty == Type::F64 => b.f64const(f64::from_bits(k)).unwrap(),
+        Some(k) => b.f32const(f32::from_bits(k as u32)).unwrap(),
+        None => b.convert(ConvOp::Bitcast, Policy::NONE, y, ty).unwrap(),
+    };
+    let p = b.binary(BinaryOp::Pow, Policy::NONE, fx, fy).unwrap();
+    let r = b
+        .convert(ConvOp::Bitcast, Policy::NONE, p, bits_ty)
+        .unwrap();
+    b.ret(&[r]).unwrap();
+    (m, f)
+}
+
+#[test]
+fn test_float_pow_is_ls_pow_bit_for_bit() {
+    let mut rng = common::irgen::Rng::new(77);
+    let mut vals: Vec<f64> = float_edges();
+    for _ in 0..30 {
+        // Ordinary values of both signs and wide magnitudes.
+        let mant = (rng.next() % 2_000_000) as f64 / 1000.0;
+        let exp = (rng.next() % 40) as i32 - 20;
+        let sign = if rng.chance(30) { -1.0 } else { 1.0 };
+        vals.push(sign * mant * 10f64.powi(exp));
+    }
+    for ty in [Type::F64, Type::F32] {
+        let mask = if ty == Type::F32 {
+            0xFFFF_FFFF
+        } else {
+            u64::MAX
+        };
+        let arg_ty = if ty == Type::F64 {
+            Type::U64
+        } else {
+            Type::U32
+        };
+        let bits: Vec<u64> = vals
+            .iter()
+            .map(|&v| {
+                if ty == Type::F64 {
+                    v.to_bits()
+                } else {
+                    u64::from((v as f32).to_bits())
+                }
+            })
+            .collect();
+        for const_y in [None, Some(bits[4]), Some(bits[6]), Some(bits[23])] {
+            let (m, f) = float_pow_module(ty, const_y);
+            m.validate().unwrap();
+            let want = |x: u64, y: u64| -> u64 {
+                let y = const_y.unwrap_or(y);
+                let got = match interp::run(&m, f, &[Val::new(arg_ty, x), Val::new(arg_ty, y)])
+                    .unwrap()
+                {
+                    Outcome::Return(v) => v[0].bits(),
+                    other => panic!("{other:?}"),
+                };
+                // The interpreter's float pow is ir-lang's ls_pow, and so is
+                // the runtime routine the harness binds.
+                let direct = if ty == Type::F64 {
+                    load::pow_f64_bits(x, y)
+                } else {
+                    u64::from(load::pow_f32_bits(x as u32, y as u32))
+                };
+                assert_eq!(got, direct);
+                got
+            };
+            let import = if ty == Type::F64 {
+                "__lexersketch_pow_f64"
+            } else {
+                "__lexersketch_pow_f32"
+            };
+            for conv in [Conv::SysV, Conv::Win64] {
+                let opts = match conv {
+                    Conv::SysV => Options::sysv(),
+                    Conv::Win64 => Options::win64(),
+                };
+                let c = backend_lang::compile(&m, &opts).unwrap();
+                assert_eq!(c.imports(), [import]);
+                let img = load::load(&c).unwrap();
+                // Junk above an f32's 32 bits, as a caller may leave it.
+                let junk = if ty == Type::F32 {
+                    0xA5A5_0000_0000_0000
+                } else {
+                    0
+                };
+                for &x in &bits {
+                    for &y in &bits {
+                        let mut mach = load::machine(&img);
+                        let mut hosts = Hosts::new(&img, conv);
+                        let stop = load::call(
+                            &img,
+                            &mut mach,
+                            conv,
+                            "f",
+                            &[x | junk, y | junk],
+                            &mut hosts,
+                            x ^ y,
+                        );
+                        assert_eq!(stop, Ok(Stop::Returned));
+                        assert_eq!(
+                            mach.regs[0] & mask,
+                            want(x, y),
+                            "{ty} {conv:?} pow({x:#x}, {y:#x})"
+                        );
+                    }
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+            {
+                use common::native::{Native, Ran};
+                let conv = if cfg!(windows) {
+                    Conv::Win64
+                } else {
+                    Conv::SysV
+                };
+                let c = backend_lang::compile(&m, &Options::host()).unwrap();
+                let n = Native::load(&c, conv).unwrap();
+                for &x in &bits {
+                    for &y in &bits {
+                        match n.call("f", &[x, y]).unwrap() {
+                            Ran::Returned(r, _) => {
+                                assert_eq!(r & mask, want(x, y), "native {ty} pow({x:#x}, {y:#x})")
+                            }
+                            other => panic!("{other:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
