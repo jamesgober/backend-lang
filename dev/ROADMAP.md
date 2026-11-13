@@ -1,7 +1,6 @@
 # backend-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../_lexersketch/ROADMAP.md and ../_lexersketch/NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
