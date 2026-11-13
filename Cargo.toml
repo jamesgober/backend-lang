@@ -19,7 +19,7 @@ readme = "README.md"
 description = "Native backend: instruction selection from ir-lang, SSA register allocation with stack maps, and x86-64 emission through isa-lang."
 
 # Keywords (5 max)
-keywords = ["backend", "codegen", "register-allocation", "compiler", "lexersketch"]
+keywords = ["backend", "codegen", "register-allocation", "compiler"]
 
 # Categories
 categories = ["compilers", "development-tools"]

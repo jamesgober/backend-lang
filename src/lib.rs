@@ -1,6 +1,6 @@
 //! # backend_lang
 //!
-//! The LexerSketch native backend: instruction selection from ir-lang 2.0,
+//! The toolchain's native backend: instruction selection from ir-lang 2.0,
 //! SSA register allocation with exact stack maps, and emission to x86-64
 //! machine code through [`isa_lang`], on top of a machine IR over virtual and
 //! physical registers, target descriptions that state everything the backend
